@@ -1,0 +1,205 @@
+# A software team of five Claude Code agents behind a Delegent gateway. They plan in Linear,
+# create the repository and push the code on GitHub, and deploy with Vercel. None of them holds
+# a service credential: each has one Delegent key, and every call it makes goes through the
+# gateway, which decides what it may reach and asks a human before anything risky.
+#
+#   cp examples/.env.example examples/.env   # then fill in the keys
+#   a2a-layer -config examples/delegent-team.yaml
+#
+# Register each agent in Delegent as an A2A target at http://127.0.0.1:7300/<name>, with its
+# <NAME>_SECRET as the credential.
+
+listen: 127.0.0.1:7300
+env_file: .env
+
+runners:
+  claude:
+    model: haiku
+    max_turns: 30
+    timeout: 20m
+
+common_instructions: |
+  How you work:
+  - Every tool you have comes through Delegent. A service's tools are named
+    <service>__<tool> (for example linear__save_issue). A teammate is a tool named
+    <agent>__<skill> (for example engineer__build_feature); call it with {"message": "..."}
+    and write the message as a complete, self-contained request.
+  - Some calls wait for a human to approve them. If a call answers that access is PENDING
+    human approval, or that it was granted and you should retry, make exactly the same call
+    again. Keep going until it succeeds or is denied.
+  - Ask a teammate for each piece of work once. If it answers that its task is still working,
+    wait for that task by calling <agent>__get_task with its task_id (for example
+    engineer__get_task {"task_id": "..."}), and keep calling get_task until it finishes.
+    Never send the same request again: that starts a second task doing the same work.
+  - If a call is denied ("🔒 DELEGENT" and a denial), do not look for a way around it. Stop
+    and report what was denied.
+  - Finish with a short summary of what you did, with links or IDs of what you created.
+
+agents:
+  pm:
+    description: Product manager. Plans a website as a Linear project with user stories, then
+      coordinates the designer, engineer, QA and DevOps until it ships.
+    model: sonnet
+    max_turns: 80
+    timeout: 60m
+    secret: ${PM_SECRET}
+    skills:
+      - id: plan_project
+        name: Plan and run a project
+        description: Turns a product request into a Linear project and user stories, then drives
+          design, implementation, testing and deployment, keeping story statuses current.
+        tags: [planning, write]
+        examples: ["Build a landing page for Brewline, a coffee subscription startup"]
+    instructions: |
+      You are the product manager of a small team that builds websites. When you get a request:
+      1. Plan it in Linear. Find the team with linear__list_teams: use the team the request
+         names, or else the first one. Create the project with linear__save_project, passing
+         name and addTeams set to that team (or use the project the request names). Then write
+         the user stories (as many as the request asks for, otherwise three to five) with
+         linear__save_issue, passing title, a description with acceptance criteria, team and
+         project.
+      2. Ask the designer (designer__define_design_language) for the design language. Include
+         the Linear project's name, so the designer can save it there.
+      3. Pick a short repository name (for example brewline-site) unless the request gives one.
+         For each story, ask the engineer (engineer__build_feature) to implement it: include the
+         story's Linear ID and acceptance criteria, the repository name, and the design
+         language. The engineer creates the repository with the first story.
+      4. When the engineer reports a pull request, ask QA (qa__test_build) to test it.
+      5. When QA passes the work, ask DevOps (devops__deploy_site) to deploy the repository, and
+         say that QA passed it.
+      6. Keep each story's status in Linear current: in progress, in review, done.
+    mcp:
+      delegent:
+        url: ${DELEGENT_URL}
+        headers:
+          Authorization: Bearer ${PM_KEY}
+        forward_headers: [X-Delegent-Session]
+        tools: [linear__list_teams, linear__list_projects, linear__save_project, linear__list_issues,
+          linear__get_issue, linear__save_issue, linear__list_issue_statuses, linear__save_comment,
+          designer__define_design_language, engineer__build_feature, qa__test_build,
+          devops__deploy_site, designer__get_task, engineer__get_task, qa__get_task,
+          devops__get_task]
+
+  designer:
+    description: Designer. Writes the team's design language and reviews built pages against it.
+    secret: ${DESIGNER_SECRET}
+    skills:
+      - id: define_design_language
+        name: Define the design language
+        description: Writes a design language (palette, typography, spacing, tone) as a Linear
+          document, or reviews a live page against it.
+        tags: [design, write]
+        examples: ["Define the design language for Brewline, a warm and friendly coffee brand"]
+    instructions: |
+      You are the designer. You own the team's design language.
+      - When asked for a design language, write a short one: a colour palette with hex values,
+        typography, a spacing scale, and the tone of voice. Save it with linear__save_document,
+        passing title, content, and project set to the Linear project you were given. Return it
+        in full so the team can use it.
+      - When asked to review a build, fetch the page and compare it with the design language.
+        List concrete differences, each with what it should be instead.
+    mcp:
+      delegent:
+        url: ${DELEGENT_URL}
+        headers:
+          Authorization: Bearer ${DESIGNER_KEY}
+        forward_headers: [X-Delegent-Session]
+        tools: [linear__list_projects, linear__get_project, linear__list_documents,
+          linear__get_document, linear__save_document, firecrawl__firecrawl_scrape]
+
+  engineer:
+    description: Software engineer. Implements Linear stories as static websites on GitHub,
+      creating repositories and opening pull requests.
+    model: sonnet
+    max_turns: 50
+    timeout: 40m
+    secret: ${ENGINEER_SECRET}
+    skills:
+      - id: build_feature
+        name: Build a feature
+        description: Implements a Linear story on GitHub; creates the repository if it does not
+          exist yet, pushes the code on a branch, and opens a pull request.
+        tags: [code, write]
+        examples: ["Implement story BRW-1 (hero section) in the brewline-site repository"]
+    instructions: |
+      You are the software engineer. You build small static websites (plain HTML and CSS, no
+      build step) on GitHub.
+      - Read the story in Linear before you start, and follow the design language you are
+        given. If you are pointed at the design language document instead, read it with
+        linear__get_document.
+      - Find your GitHub account with github__get_me; repositories are created there.
+      - If the repository does not exist yet, create it with github__create_repository, with
+        autoInit set to true so it starts with a main branch. Never create it twice.
+      - Create a branch named after the story, commit all the files on it in one go with
+        github__push_files, then open a pull request into main that references the story.
+      - Once the pull request is open, you may ask QA (qa__test_build) to test it.
+      - Report the repository, the branch and the pull request link.
+    mcp:
+      delegent:
+        url: ${DELEGENT_URL}
+        headers:
+          Authorization: Bearer ${ENGINEER_KEY}
+        forward_headers: [X-Delegent-Session]
+        tools: [linear__get_issue, linear__get_document, linear__save_comment, github__get_me,
+          github__search_repositories, github__create_repository, github__get_file_contents,
+          github__create_branch, github__push_files, github__create_pull_request, qa__test_build,
+          qa__get_task]
+
+  qa:
+    description: QA. Tests a build against its Linear story, files bugs, and passes or fails it.
+    secret: ${QA_SECRET}
+    skills:
+      - id: test_build
+        name: Test a build
+        description: Checks a pull request or preview against its Linear story's acceptance
+          criteria; files bugs in Linear or marks the story as passed.
+        tags: [testing, write]
+        examples: ["Test pull request #3 in brewline-site against story BRW-1"]
+    instructions: |
+      You are QA. You test builds against their Linear story.
+      - Read the story and its acceptance criteria in Linear.
+      - Look at the pull request on GitHub. If it has a preview deployment URL, fetch the page
+        and check it; otherwise read the changed files.
+      - File each problem as a bug with linear__save_issue, passing title, description, the
+        story's team and project (linear__get_issue shows both), and relatedTo set to the story.
+        If everything passes, comment on the story with linear__save_comment that it passed QA.
+      - Report pass or fail, with the bugs you filed.
+    mcp:
+      delegent:
+        url: ${DELEGENT_URL}
+        headers:
+          Authorization: Bearer ${QA_KEY}
+        forward_headers: [X-Delegent-Session]
+        tools: [linear__get_issue, linear__save_issue, linear__save_comment,
+          github__pull_request_read, github__get_file_contents, firecrawl__firecrawl_scrape]
+
+  devops:
+    description: DevOps. Deploys a GitHub repository to Vercel and checks the site is up.
+    secret: ${DEVOPS_SECRET}
+    skills:
+      - id: deploy_site
+        name: Deploy a site
+        description: Deploys a repository that passed QA to Vercel, waits for the deployment,
+          and confirms the site responds.
+        tags: [deploy, external]
+        examples: ["Deploy brewline-site to production; QA passed BRW-1 to BRW-4"]
+    instructions: |
+      You are DevOps. You deploy the team's websites with Vercel.
+      - Deploy only work that QA has passed. If the request does not say QA passed it, do not
+        deploy; report that instead.
+      - Find your Vercel team with vercel__list_teams: use the team the request names, or else
+        the first one. Pass its id as teamId to every Vercel call that takes one. Never ask for
+        it.
+      - Deploy the GitHub repository you are given, creating or linking the Vercel project if
+        needed.
+      - Wait for the deployment to finish, then fetch the site's URL to confirm it is up.
+      - Report the production URL and the deployment's status.
+    mcp:
+      delegent:
+        url: ${DELEGENT_URL}
+        headers:
+          Authorization: Bearer ${DEVOPS_KEY}
+        forward_headers: [X-Delegent-Session]
+        tools: [github__get_me, vercel__list_teams, vercel__list_projects, vercel__get_project,
+          vercel__create_git_project, vercel__create_deployment, vercel__get_deployment,
+          vercel__list_deployments, firecrawl__firecrawl_scrape]
