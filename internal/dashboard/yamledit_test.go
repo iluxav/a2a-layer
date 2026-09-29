@@ -12,9 +12,9 @@ const sample = `# The team.
 listen: 127.0.0.1:7300
 env_file: .env
 
-runners:
+cli:
   claude:
-    model: haiku   # cheap
+    command: claude   # on PATH
 
 agents:
   # The planner.
@@ -78,9 +78,9 @@ func TestAddingAnEntryFollowsTheSectionsSpacing(t *testing.T) {
 	if !strings.Contains(got, "      Report bugs.\n\n  devops:\n    description: Deploys.\n\n# trailing comment\n") {
 		t.Errorf("got:\n%s", got)
 	}
-	// One runner: no blank line between runners.
-	got = mustPut(t, sample, "runners", "", "codex", &yaml.Node{Kind: yaml.MappingNode})
-	if !strings.Contains(got, "    model: haiku   # cheap\n  codex: {}\n\nagents:") {
+	// One entry: no blank line between entries.
+	got = mustPut(t, sample, "cli", "", "codex", &yaml.Node{Kind: yaml.MappingNode})
+	if !strings.Contains(got, "    command: claude   # on PATH\n  codex: {}\n\nagents:") {
 		t.Errorf("got:\n%s", got)
 	}
 }
@@ -104,7 +104,7 @@ func TestRemovingAnEntryLeavesNoGap(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.HasPrefix(string(out), "# The team.\nlisten: 127.0.0.1:7300\n\nrunners:") {
+	if !strings.HasPrefix(string(out), "# The team.\nlisten: 127.0.0.1:7300\n\ncli:") {
 		t.Errorf("got:\n%s", out)
 	}
 }
@@ -115,11 +115,11 @@ func TestNewTopLevelKeysGoInOrder(t *testing.T) {
 		t.Errorf("got:\n%s", got)
 	}
 	got = mustPut(t, sample, "", "", "common_instructions", strNode("Line one.\nLine two.\n"))
-	if !strings.Contains(got, "env_file: .env\ncommon_instructions: |\n  Line one.\n  Line two.\n\nrunners:") {
+	if !strings.Contains(got, "env_file: .env\ncommon_instructions: |\n  Line one.\n  Line two.\n\ncli:") {
 		t.Errorf("got:\n%s", got)
 	}
-	got = mustPut(t, "agents:\n  pm:\n    description: x\n", "", "", "runners", &yaml.Node{Kind: yaml.MappingNode, Content: []*yaml.Node{plainNode("claude"), {Kind: yaml.MappingNode}}})
-	if got != "runners:\n  claude: {}\n\nagents:\n  pm:\n    description: x\n" {
+	got = mustPut(t, "agents:\n  pm:\n    description: x\n", "", "", "cli", &yaml.Node{Kind: yaml.MappingNode, Content: []*yaml.Node{plainNode("claude"), {Kind: yaml.MappingNode}}})
+	if got != "cli:\n  claude: {}\n\nagents:\n  pm:\n    description: x\n" {
 		t.Errorf("got:\n%s", got)
 	}
 }

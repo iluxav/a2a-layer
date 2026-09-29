@@ -58,6 +58,9 @@ func (e *echoRunner) Run(ctx context.Context, job runner.Job, progress runner.Pr
 	return runner.Result{Text: "echo: " + job.Prompt, Turns: 1, CostUSD: 0.002}, nil
 }
 
+// Info implements runner.Describer: like claude, it takes permission rules.
+func (e *echoRunner) Info() runner.Info { return runner.Info{ToolRules: true} }
+
 // newDashboard serves a dashboard for a config file holding body ("" for no file) on a real
 // listener, as the playground's MCP proxy needs.
 func newDashboard(t *testing.T, body string, r runner.Runner) (*Dashboard, *httptest.Server, string) {
@@ -75,7 +78,7 @@ func newDashboard(t *testing.T, body string, r runner.Runner) (*Dashboard, *http
 	d, err := New(Options{Path: path, BaseURL: "http://" + ln.Addr().String(),
 		NewRunners: func(cfg *config.Config) (map[string]runner.Runner, error) {
 			out := map[string]runner.Runner{}
-			for name := range cfg.Runners {
+			for _, name := range runner.Types() {
 				out[name] = r
 			}
 			return out, nil
@@ -226,6 +229,79 @@ func TestBuiltinToolsAreOptIn(t *testing.T) {
 	}
 }
 
+func TestBuiltinToolsAreChosenPerAgent(t *testing.T) {
+	_, ts, path := newDashboard(t, "agents:\n  pc:\n    description: This machine.\n", &echoRunner{})
+	agent := func(mode, rules string) string {
+		t.Helper()
+		form := url.Values{"name": {"pc"}, "original": {"pc"}, "description": {"This machine."}, "cli": {"claude"}, "builtin_mode": {mode}, "builtin_tools": {rules}}
+		if _, page, _ := post(t, ts, "/agents", form); strings.Contains(page, "Not saved") {
+			t.Fatalf("%s: not saved:\n%s", mode, page)
+		}
+		_, got, _ := strings.Cut(readFile(t, path), "    description: This machine.\n")
+		return got
+	}
+	for _, c := range []struct{ mode, want string }{
+		{"all", "    builtin_tools: [default]\n"}, {"rules", "    builtin_tools: [Read]\n"}, {"none", ""},
+	} {
+		if got := agent(c.mode, "Read"); got != c.want {
+			t.Errorf("%s: wrote %q, want %q", c.mode, got, c.want)
+		}
+	}
+	if _, page, _ := post(t, ts, "/agents", url.Values{"name": {"pc"}, "original": {"pc"}, "description": {"x"}, "builtin_mode": {"rules"}}); !strings.Contains(page, "list at least one rule") {
+		t.Error("an empty rule list should be refused")
+	}
+	agent("all", "")
+	if page := get(t, ts, "/agents"); !strings.Contains(page, "machine access") {
+		t.Error("an agent with all tools should be flagged")
+	}
+	if page := get(t, ts, "/agents/pc/edit"); !strings.Contains(page, `value="all" checked`) {
+		t.Error("the agent form should show all tools")
+	}
+}
+
+func TestPickingCodexNeedsNothingElse(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "agents.yaml")
+	os.WriteFile(path, []byte("agents:\n  pm:\n    description: Plans.\n"), 0o600)
+	d, err := New(Options{Path: path, BaseURL: "http://127.0.0.1:1"}) // the real runners
+	if err != nil {
+		t.Fatal(err)
+	}
+	ts := httptest.NewServer(d.Handler())
+	t.Cleanup(func() { d.Shutdown(); ts.Close() })
+
+	page := get(t, ts, "/agents/new")
+	if !strings.Contains(page, `<option value="claude" selected>claude</option>`) || !strings.Contains(page, `<option value="codex">codex</option>`) {
+		t.Error("the agent form should offer every CLI, claude first")
+	}
+	// Rules on codex are refused at once, not when a task runs.
+	form := url.Values{"name": {"rev"}, "description": {"Reviews."}, "cli": {"codex"}, "builtin_mode": {"rules"}, "builtin_tools": {"Bash(lspci *)"}}
+	if _, page, _ := post(t, ts, "/agents", form); !strings.Contains(page, "agent rev: cli codex: builtin_tools: this CLI takes [default] or none") {
+		t.Errorf("rules on codex should be refused:\n%s", page)
+	}
+	form.Set("builtin_mode", "all")
+	if _, page, _ := post(t, ts, "/agents", form); strings.Contains(page, "Not saved") {
+		t.Fatalf("not saved:\n%s", page)
+	}
+	// Nothing but the agent is written: no runners, and pm is left as it was.
+	want := "agents:\n  pm:\n    description: Plans.\n  rev:\n    description: Reviews.\n    cli: codex\n    builtin_tools: [default]\n"
+	if got := readFile(t, path); got != want {
+		t.Errorf("file:\n%s\nwant:\n%s", got, want)
+	}
+	// The form follows the CLI: codex offers no rules and suggests no claude models.
+	part := get(t, ts, "/parts/cli?cli=codex&builtin_mode=all")
+	if strings.Contains(part, `value="rules"`) || !strings.Contains(part, "takes no permission rules") || strings.Contains(part, "sonnet") {
+		t.Errorf("codex control:\n%s", part)
+	}
+	part = get(t, ts, "/parts/cli?cli=claude&builtin_mode=rules&builtin_tools=Read")
+	if !strings.Contains(part, `value="rules" checked`) || !strings.Contains(part, ">Read</textarea>") ||
+		!strings.Contains(part, `data-model="fable"`) || !strings.Contains(part, `id="models" hx-swap-oob="true"`) {
+		t.Errorf("claude control:\n%s", part)
+	}
+	if page := get(t, ts, "/agents/pm/edit"); !strings.Contains(page, `data-model="sonnet"`) || !strings.Contains(page, "Empty: the claude CLI&#39;s default.") {
+		t.Error("the agent form should offer its CLI's models")
+	}
+}
+
 func TestARunDoesNotRepeatItsAnswerInItsLog(t *testing.T) {
 	r := &run{Started: time.Now(), done: true, ended: time.Now(),
 		notes: []string{"started", "calling Bash: lspci", "You have an RTX 4090."}}
@@ -244,13 +320,13 @@ func TestAChangeThatBreaksTheConfigIsNotSaved(t *testing.T) {
 	const body = "# my agents\nagents:\n  pm:\n    description: Plans.   # keep me\n"
 	_, ts, path := newDashboard(t, body, &echoRunner{})
 	cases := map[string]url.Values{
-		"lowercase letters":                        {"name": {"Bad Name"}, "description": {"x"}},
-		"not a whole number":                       {"name": {"qa"}, "description": {"x"}, "max_turns": {"lots"}},
-		"not a duration":                           {"name": {"qa"}, "description": {"x"}, "timeout": {"soon"}},
-		"description is required":                  {"name": {"qa"}, "description": {""}},
-		"NOPE_NOT_SET":                             {"name": {"qa"}, "description": {"x"}, "secret": {"${NOPE_NOT_SET}"}},
-		"already an agent named pm":                {"name": {"pm"}, "original": {""}, "description": {"x"}},
-		`runner &#34;codex&#34; is not configured`: {"name": {"qa"}, "description": {"x"}, "runner": {"codex"}},
+		"lowercase letters":                              {"name": {"Bad Name"}, "description": {"x"}},
+		"not a whole number":                             {"name": {"qa"}, "description": {"x"}, "max_turns": {"lots"}},
+		"not a duration":                                 {"name": {"qa"}, "description": {"x"}, "timeout": {"soon"}},
+		"description is required":                        {"name": {"qa"}, "description": {""}},
+		"NOPE_NOT_SET":                                   {"name": {"qa"}, "description": {"x"}, "secret": {"${NOPE_NOT_SET}"}},
+		"already an agent named pm":                      {"name": {"pm"}, "original": {""}, "description": {"x"}},
+		`cli &#34;nosuch&#34; is not one a2a-layer runs`: {"name": {"qa"}, "description": {"x"}, "cli": {"nosuch"}},
 	}
 	for want, form := range cases {
 		status, page, h := post(t, ts, "/agents", form)
@@ -277,30 +353,30 @@ func TestAProblemTheFileAlreadyHasDoesNotBlockOtherChanges(t *testing.T) {
 	}
 }
 
-func TestRunnersKeepEachAgentOnItsRunner(t *testing.T) {
-	const body = "agents:\n  pm:\n    description: Plans.\n  qa:\n    description: Tests.\n"
+func TestCLISettingsAreOptional(t *testing.T) {
+	const body = "listen: 127.0.0.1:7300\n\nagents:\n  pm:\n    description: Plans.\n"
 	_, ts, path := newDashboard(t, body, &echoRunner{})
-	if page := get(t, ts, "/runners"); !strings.Contains(page, "implicit") {
-		t.Error("with no runners, the implicit default should be listed")
+	page := get(t, ts, "/settings")
+	if !strings.Contains(page, `name="cli_claude_command"`) || !strings.Contains(page, `name="cli_codex_env"`) {
+		t.Fatal("the settings page should have a section for each CLI")
 	}
-	// A second runner: the implicit default is written beside it, and the agents keep it.
-	if _, page, _ := post(t, ts, "/runners", url.Values{"name": {"fast"}, "type": {"claude"}, "model": {"haiku"}}); strings.Contains(page, "Not saved") {
-		t.Fatalf("add runner:\n%s", page)
+	form := url.Values{"listen": {"127.0.0.1:7300"}, "cli_claude_command": {"/opt/claude/bin/claude"}, "cli_claude_env": {"CLAUDE_CONFIG_DIR=/home/me/.claude-work"}}
+	if _, page, _ := post(t, ts, "/settings", form); strings.Contains(page, "Not saved") {
+		t.Fatalf("not saved:\n%s", page)
 	}
-	want := "runners:\n  claude: {}\n  fast:\n    type: claude\n    model: haiku\n\nagents:\n  pm:\n    description: Plans.\n    runner: claude\n  qa:\n    description: Tests.\n    runner: claude\n"
+	want := "listen: 127.0.0.1:7300\n\ncli:\n  claude:\n    command: /opt/claude/bin/claude\n    env:\n      CLAUDE_CONFIG_DIR: /home/me/.claude-work\n\nagents:\n  pm:\n    description: Plans.\n"
 	if got := readFile(t, path); got != want {
 		t.Errorf("file:\n%s\nwant:\n%s", got, want)
 	}
-	// Renaming a runner renames it on its agents.
-	if _, page, _ := post(t, ts, "/runners", url.Values{"name": {"cc"}, "original": {"claude"}, "type": {"claude"}}); strings.Contains(page, "Not saved") {
-		t.Fatalf("rename runner:\n%s", page)
+	if _, page, _ := post(t, ts, "/settings", url.Values{"listen": {"127.0.0.1:7300"}, "cli_codex_env": {"garbage"}}); !strings.Contains(page, "codex: environment") {
+		t.Error("a bad environment line should be refused")
 	}
-	if got := readFile(t, path); strings.Count(got, "runner: cc\n") != 2 || !strings.Contains(got, "  cc:\n    type: claude\n") {
-		t.Errorf("file:\n%s", got)
+	// Emptied, the section goes away.
+	if _, page, _ := post(t, ts, "/settings", url.Values{"listen": {"127.0.0.1:7300"}}); strings.Contains(page, "Not saved") {
+		t.Fatalf("not saved:\n%s", page)
 	}
-	// A runner agents use cannot be deleted.
-	if _, page, _ := post(t, ts, "/runners/cc/delete", nil); !strings.Contains(page, `runner &#34;cc&#34; is not configured`) {
-		t.Errorf("deleting a used runner should be refused:\n%s", page)
+	if got := readFile(t, path); got != body {
+		t.Errorf("file:\n%s\nwant:\n%s", got, body)
 	}
 }
 

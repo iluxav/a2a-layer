@@ -1,10 +1,12 @@
 package dashboard
 
 import (
+	"cmp"
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
 	"net/url"
+	"os/exec"
 	"regexp"
 	"slices"
 	"strconv"
@@ -12,6 +14,9 @@ import (
 	"time"
 
 	"gopkg.in/yaml.v3"
+
+	"github.com/iluxav/a2a-layer/internal/config"
+	"github.com/iluxav/a2a-layer/internal/runner"
 )
 
 // The forms show and take values as the file writes them, before ${NAME} expansion, so a
@@ -21,14 +26,14 @@ var namePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]*$`)
 
 // agentForm is one agent as its form edits it.
 type agentForm struct {
-	Name, Original                                        string // Original is the name it was loaded under ("" for a new agent)
-	Description, Version, Instructions                    string
-	Runner, Model, MaxTurns, Timeout, MaxParallel, Secret string
-	Remember                                              bool
-	IdleTimeout, MaxTasks                                 string
-	BuiltinTools                                          string // one permission rule per line
-	MCP                                                   []mcpForm
-	Skills                                                []skillForm
+	Name, Original                                     string // Original is the name it was loaded under ("" for a new agent)
+	Description, Version, Instructions                 string
+	CLI, Model, MaxTurns, Timeout, MaxParallel, Secret string
+	Remember                                           bool
+	IdleTimeout, MaxTasks                              string
+	Builtin                                            builtinForm
+	MCP                                                []mcpForm
+	Skills                                             []skillForm
 }
 
 // mcpForm is one MCP server of an agent. Headers are "Name: value" lines; ForwardHeaders and
@@ -42,14 +47,25 @@ type skillForm struct {
 	Row, ID, Name, Description, Tags, Examples string
 }
 
-type runnerForm struct {
-	Name, Original, Type, Command, Model, MaxTurns, Timeout string
-	Args                                                    string // one per line
-	Env                                                     string // KEY=VALUE lines
+// builtinForm is a choice of built-in tools: "none" (sealed; not written), "all" ([default])
+// or "rules" (Rules, one per line).
+type builtinForm struct {
+	Mode, Rules string
 }
 
 type settingsForm struct {
 	Listen, PublicURL, EnvFile, WorkDir, CommonInstructions string
+	CLI                                                     []cliForm // one per CLI a2a-layer runs
+}
+
+// cliForm is how one CLI is run: its entry of the cli section. All empty, it runs as its own
+// command on PATH.
+type cliForm struct {
+	Name, Command string
+	Args          string // one per line
+	Env           string // KEY=VALUE lines
+	Bin           string // what runs: Command, or the CLI's name
+	Found         bool   // Bin is on PATH
 }
 
 // The raw* types decode an entry with every scalar as written, so "30" and "${TURNS}" both fit.
@@ -59,13 +75,12 @@ type rawAgent struct {
 	Version      string     `yaml:"version"`
 	Instructions string     `yaml:"instructions"`
 	Skills       []rawSkill `yaml:"skills"`
-	Runner       string     `yaml:"runner"`
+	CLI          string     `yaml:"cli"`
 	Model        string     `yaml:"model"`
 	MaxTurns     string     `yaml:"max_turns"`
 	Timeout      string     `yaml:"timeout"`
 	MaxParallel  string     `yaml:"max_parallel"`
 	Secret       string     `yaml:"secret"`
-	BuiltinTools []string   `yaml:"builtin_tools"`
 	Context      struct {
 		Remember    string `yaml:"remember"`
 		IdleTimeout string `yaml:"idle_timeout"`
@@ -88,14 +103,10 @@ type rawMCP struct {
 	Tools          []string          `yaml:"tools"`
 }
 
-type rawRunner struct {
-	Type     string            `yaml:"type"`
-	Command  string            `yaml:"command"`
-	Model    string            `yaml:"model"`
-	MaxTurns string            `yaml:"max_turns"`
-	Timeout  string            `yaml:"timeout"`
-	Args     []string          `yaml:"args"`
-	Env      map[string]string `yaml:"env"`
+type rawCLI struct {
+	Command string            `yaml:"command"`
+	Args    []string          `yaml:"args"`
+	Env     map[string]string `yaml:"env"`
 }
 
 // agentFromNode reads an agent's entry into its form.
@@ -109,10 +120,10 @@ func agentFromNode(name string, n *yaml.Node) (agentForm, error) {
 		return f, fmt.Errorf("agent %s: %w", name, err)
 	}
 	f.Description, f.Version, f.Instructions = a.Description, a.Version, a.Instructions
-	f.Runner, f.Model, f.MaxTurns, f.Timeout, f.MaxParallel, f.Secret = a.Runner, a.Model, a.MaxTurns, a.Timeout, a.MaxParallel, a.Secret
+	f.CLI, f.Model, f.MaxTurns, f.Timeout, f.MaxParallel, f.Secret = a.CLI, a.Model, a.MaxTurns, a.Timeout, a.MaxParallel, a.Secret
 	f.Remember = a.Context.Remember == "true"
 	f.IdleTimeout, f.MaxTasks = a.Context.IdleTimeout, a.Context.MaxTasks
-	f.BuiltinTools = strings.Join(a.BuiltinTools, "\n")
+	f.Builtin = builtinFromNode(n)
 	for _, s := range a.Skills {
 		f.Skills = append(f.Skills, skillForm{Row: newRow(), ID: s.ID, Name: s.Name, Description: s.Description,
 			Tags: strings.Join(s.Tags, ", "), Examples: strings.Join(s.Examples, "\n")})
@@ -143,12 +154,12 @@ func agentFromForm(v url.Values) (agentForm, error) {
 		Name: strings.TrimSpace(v.Get("name")), Original: v.Get("original"),
 		Description: oneLine(v.Get("description")), Version: strings.TrimSpace(v.Get("version")),
 		Instructions: block(v.Get("instructions")),
-		Runner:       strings.TrimSpace(v.Get("runner")), Model: strings.TrimSpace(v.Get("model")),
+		CLI:          strings.TrimSpace(v.Get("cli")), Model: strings.TrimSpace(v.Get("model")),
 		MaxTurns: strings.TrimSpace(v.Get("max_turns")), Timeout: strings.TrimSpace(v.Get("timeout")),
 		MaxParallel: strings.TrimSpace(v.Get("max_parallel")), Secret: strings.TrimSpace(v.Get("secret")),
 		Remember:    v.Get("remember") == "true",
 		IdleTimeout: strings.TrimSpace(v.Get("idle_timeout")), MaxTasks: strings.TrimSpace(v.Get("max_tasks")),
-		BuiltinTools: block(v.Get("builtin_tools")),
+		Builtin: builtinFromForm(v),
 	}
 	for _, row := range v["mcp"] {
 		p := "mcp_" + row + "_"
@@ -183,6 +194,7 @@ func agentFromForm(v url.Values) (agentForm, error) {
 	errs = append(errs, checkNumber("conversation max tasks", f.MaxTasks)...)
 	errs = append(errs, checkDuration("timeout", f.Timeout)...)
 	errs = append(errs, checkDuration("conversation idle timeout", f.IdleTimeout)...)
+	errs = append(errs, f.Builtin.check()...)
 	seen := map[string]bool{}
 	for _, m := range f.MCP {
 		if seen[m.Name] {
@@ -206,7 +218,9 @@ func (f agentForm) node(old *yaml.Node) *yaml.Node {
 	m.Style = 0
 	setScalar(m, "description", f.Description, strNode)
 	setScalar(m, "version", f.Version, strNode)
-	setScalar(m, "runner", f.Runner, strNode)
+	if _, have := lookup(m, "cli"); have != nil || f.CLI != config.DefaultCLI {
+		setScalar(m, "cli", f.CLI, strNode) // the default is written only where it already was
+	}
 	setScalar(m, "model", f.Model, strNode)
 	setScalar(m, "max_turns", f.MaxTurns, plainNode)
 	setScalar(m, "timeout", f.Timeout, strNode)
@@ -225,7 +239,7 @@ func (f agentForm) node(old *yaml.Node) *yaml.Node {
 
 	f.setSkills(m)
 	setScalar(m, "instructions", f.Instructions, strNode)
-	setList(m, "builtin_tools", lines(f.BuiltinTools))
+	f.Builtin.set(m)
 
 	servers := childMapping(m, "mcp")
 	merged := &yaml.Node{Kind: yaml.MappingNode}
@@ -280,63 +294,60 @@ func sameSkill(a, b rawSkill) bool {
 		slices.Equal(a.Tags, b.Tags) && slices.Equal(a.Examples, b.Examples)
 }
 
-func runnerFromNode(name string, n *yaml.Node) (runnerForm, error) {
-	f := runnerForm{Name: name, Original: name}
-	if n == nil {
-		return f, nil
+// builtinFromNode reads an agent's builtin_tools.
+func builtinFromNode(n *yaml.Node) builtinForm {
+	_, v := lookup(n, "builtin_tools")
+	var tools []string
+	if v == nil || v.Kind == yaml.ScalarNode || v.Decode(&tools) != nil || len(tools) == 0 {
+		return builtinForm{Mode: "none"}
 	}
-	var r rawRunner
-	if err := n.Decode(&r); err != nil {
-		return f, fmt.Errorf("runner %s: %w", name, err)
+	switch {
+	case slices.Equal(tools, []string{"default"}):
+		return builtinForm{Mode: "all"}
 	}
-	f.Type, f.Command, f.Model, f.MaxTurns, f.Timeout = r.Type, r.Command, r.Model, r.MaxTurns, r.Timeout
-	f.Args = strings.Join(r.Args, "\n")
-	var env []string
-	for _, k := range sortedKeys(r.Env) {
-		env = append(env, k+"="+r.Env[k])
-	}
-	f.Env = strings.Join(env, "\n")
-	return f, nil
+	return builtinForm{Mode: "rules", Rules: strings.Join(tools, "\n")}
 }
 
-func runnerFromForm(v url.Values) (runnerForm, error) {
-	f := runnerForm{
-		Name: strings.TrimSpace(v.Get("name")), Original: v.Get("original"),
-		Type: strings.TrimSpace(v.Get("type")), Command: strings.TrimSpace(v.Get("command")),
-		Model: strings.TrimSpace(v.Get("model")), MaxTurns: strings.TrimSpace(v.Get("max_turns")),
-		Timeout: strings.TrimSpace(v.Get("timeout")), Args: block(v.Get("args")), Env: block(v.Get("env")),
+func builtinFromForm(v url.Values) builtinForm {
+	b := builtinForm{Mode: v.Get("builtin_mode"), Rules: block(v.Get("builtin_tools"))}
+	if !slices.Contains([]string{"none", "all", "rules"}, b.Mode) {
+		b.Mode = "none"
+		if b.Rules != "" {
+			b.Mode = "rules"
+		}
 	}
-	var errs []string
-	if !namePattern.MatchString(f.Name) {
-		errs = append(errs, "name: use lowercase letters, digits, - and _")
-	}
-	errs = append(errs, checkNumber("max turns", f.MaxTurns)...)
-	errs = append(errs, checkDuration("timeout", f.Timeout)...)
-	if _, _, err := parsePairs(f.Env, "="); err != nil {
-		errs = append(errs, "environment: "+err.Error())
-	}
-	return f, joinErrs(errs)
+	return b
 }
 
-func (f runnerForm) node(old *yaml.Node) *yaml.Node {
-	m := old
-	if m == nil || m.Kind != yaml.MappingNode {
-		m = &yaml.Node{Kind: yaml.MappingNode}
+// tools are the builtin_tools the choice writes (nil for none).
+func (b builtinForm) tools() []string {
+	switch b.Mode {
+	case "all":
+		return []string{"default"}
+	case "rules":
+		return lines(b.Rules)
 	}
-	m.Style = 0
-	typ := f.Type
-	if typ == f.Name {
-		typ = "" // the default
+	return nil
+}
+
+func (b builtinForm) check() []string {
+	if b.Mode == "rules" && len(lines(b.Rules)) == 0 {
+		return []string{"built-in tools: list at least one rule, or pick another option"}
 	}
-	setScalar(m, "type", typ, strNode)
-	setScalar(m, "command", f.Command, strNode)
-	setScalar(m, "model", f.Model, strNode)
-	setScalar(m, "max_turns", f.MaxTurns, plainNode)
-	setScalar(m, "timeout", f.Timeout, strNode)
-	setList(m, "args", lines(f.Args))
-	keys, values, _ := parsePairs(f.Env, "=")
-	setMap(m, "env", keys, values)
-	return m
+	return nil
+}
+
+// set writes the choice into an entry, keeping its node when unchanged.
+func (b builtinForm) set(m *yaml.Node) {
+	const key = "builtin_tools"
+	switch b.Mode {
+	case "all":
+		setList(m, key, []string{"default"})
+	case "rules":
+		setList(m, key, lines(b.Rules))
+	default:
+		setKey(m, key, key, nil)
+	}
 }
 
 func settingsFromText(text []byte) (settingsForm, error) {
@@ -348,15 +359,113 @@ func settingsFromText(text []byte) (settingsForm, error) {
 		CommonInstructions string `yaml:"common_instructions"`
 	}
 	err := yaml.Unmarshal(text, &s)
-	return settingsForm(s), err
+	f := settingsForm{Listen: s.Listen, PublicURL: s.PublicURL, EnvFile: s.EnvFile, WorkDir: s.WorkDir, CommonInstructions: s.CommonInstructions}
+	for _, name := range runner.Types() {
+		f.CLI = append(f.CLI, cliSettingsIn(text, name).located())
+	}
+	return f, err
 }
 
-func settingsFromForm(v url.Values) settingsForm {
-	return settingsForm{
+func settingsFromForm(v url.Values) (settingsForm, error) {
+	f := settingsForm{
 		Listen: strings.TrimSpace(v.Get("listen")), PublicURL: strings.TrimSpace(v.Get("public_url")),
 		EnvFile: strings.TrimSpace(v.Get("env_file")), WorkDir: strings.TrimSpace(v.Get("work_dir")),
 		CommonInstructions: block(v.Get("common_instructions")),
 	}
+	var errs []string
+	for _, name := range runner.Types() {
+		p := "cli_" + name + "_"
+		c := cliForm{Name: name, Command: strings.TrimSpace(v.Get(p + "command")), Args: block(v.Get(p + "args")), Env: block(v.Get(p + "env"))}
+		if _, _, err := parsePairs(c.Env, "="); err != nil {
+			errs = append(errs, name+": environment: "+err.Error())
+		}
+		f.CLI = append(f.CLI, c.located())
+	}
+	return f, joinErrs(errs)
+}
+
+// putSettings writes the settings, leaving the ones that did not change as they are written.
+func putSettings(text []byte, s settingsForm) ([]byte, error) {
+	have, err := settingsFromText(text)
+	if err != nil {
+		return nil, err
+	}
+	old := have.values()
+	for i, kv := range s.values() {
+		key, val := kv[0], kv[1]
+		switch {
+		case val == block(old[i][1]):
+			continue
+		case val == "":
+			text, err = removeEntry(text, "", key)
+		default:
+			text, err = putEntry(text, "", key, key, strNode(val))
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
+	for _, c := range s.CLI {
+		was := cliSettingsIn(text, c.Name)
+		switch {
+		case c.Command == was.Command && c.Args == block(was.Args) && c.Env == block(was.Env):
+			continue
+		case c.empty():
+			text, err = removeEntry(text, "cli", c.Name)
+		default:
+			n, _ := entryValue(text, "cli", c.Name)
+			text, err = putEntry(text, "cli", c.Name, c.Name, c.node(n))
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
+	if es, _ := entries(text, "cli"); len(es) == 0 {
+		return removeEntry(text, "", "cli") // nothing left in it
+	}
+	return text, nil
+}
+
+// cliSettingsIn reads a CLI's entry of the cli section.
+func cliSettingsIn(text []byte, name string) cliForm {
+	f := cliForm{Name: name}
+	n, _ := entryValue(text, "cli", name)
+	var c rawCLI
+	if n == nil || n.Decode(&c) != nil {
+		return f
+	}
+	f.Command, f.Args = c.Command, strings.Join(c.Args, "\n")
+	var env []string
+	for _, k := range sortedKeys(c.Env) {
+		env = append(env, k+"="+c.Env[k])
+	}
+	f.Env = strings.Join(env, "\n")
+	return f
+}
+
+// located fills in what the CLI runs as, and whether that is on PATH.
+func (c cliForm) located() cliForm {
+	c.Bin = cmp.Or(c.Command, c.Name)
+	_, err := exec.LookPath(c.Bin)
+	c.Found = err == nil
+	return c
+}
+
+func (c cliForm) empty() bool {
+	return c.Command == "" && len(lines(c.Args)) == 0 && len(lines(c.Env)) == 0
+}
+
+func (c cliForm) node(old *yaml.Node) *yaml.Node {
+	m := old
+	if m == nil || m.Kind != yaml.MappingNode {
+		m = &yaml.Node{Kind: yaml.MappingNode}
+	}
+	m.Style = 0
+	setScalar(m, "command", c.Command, strNode)
+	setList(m, "args", lines(c.Args))
+	keys, values, _ := parsePairs(c.Env, "=")
+	setMap(m, "env", keys, values)
+	return m
 }
 
 // values are the settings by key, in the order they go into the file.

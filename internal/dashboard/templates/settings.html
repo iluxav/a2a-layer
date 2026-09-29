@@ -27,6 +27,25 @@
     <label class="wide"><textarea name="common_instructions" rows="14" class="mono" placeholder="How every agent works…">{{.CommonInstructions}}</textarea>
       <small>Appended to every agent's instructions.</small></label>
   </fieldset>
+  <fieldset>
+    <legend>CLI settings <span class="muted small">optional</span></legend>
+    <p class="hint">Leave these empty to run each CLI as its own command on PATH, under the login it already has.
+      Fill them in only to run it another way, for every agent on it.</p>
+    {{range .CLI}}
+    <details class="cli"{{if or .Command .Args .Env}} open{{end}}>
+      <summary><strong class="mono">{{.Name}}</strong> <span class="muted small">runs <code>{{.Bin}}</code></span>
+        {{if .Found}}<span class="dot ok" title="Found on PATH"></span>{{else}}<span class="dot err"></span> <span class="small err-text">not found: its agents' tasks will fail</span>{{end}}</summary>
+      <div class="grid">
+        <label>Command <input name="cli_{{.Name}}_command" value="{{.Command}}" placeholder="{{.Name}}" spellcheck="false">
+          <small>A path, when it is not on PATH.</small></label>
+        <label>Extra arguments <textarea name="cli_{{.Name}}_args" rows="2" class="mono" placeholder="One per line">{{.Args}}</textarea>
+          <small>Added to every run.</small></label>
+        <label>Environment <textarea name="cli_{{.Name}}_env" rows="2" class="mono" placeholder="KEY=value" spellcheck="false">{{.Env}}</textarea>
+          <small>For example a config dir, to run under another login.</small></label>
+      </div>
+    </details>
+    {{end}}
+  </fieldset>
   <div class="actions"><button class="btn primary">Save settings</button></div>
 </form>
 {{end}}

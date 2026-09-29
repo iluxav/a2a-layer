@@ -104,7 +104,9 @@ func (r *run) view(current *playground) runView {
 	}
 	add("model", "model", "%v")
 	add("turns", "turns", "%v")
-	add("cost", "cost_usd", "$%.4f")
+	if cost, _ := md["cost_usd"].(float64); cost > 0 { // a CLI that does not report it (codex) says 0
+		add("cost", "cost_usd", "$%.4f")
+	}
 	add("tokens in", "input_tokens", "%v")
 	add("tokens out", "output_tokens", "%v")
 	add("conversation task", "context_task", "%v")

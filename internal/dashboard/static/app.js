@@ -8,6 +8,15 @@ document.addEventListener("click", (e) => {
     return;
   }
 
+  // Pick one of the runner's models.
+  const model = e.target.closest("[data-model]");
+  if (model) {
+    const input = model.closest("form").querySelector("[name=model]");
+    input.value = model.dataset.model;
+    markModel(input);
+    return;
+  }
+
   // Use a skill's example as the playground message.
   const example = e.target.closest("[data-example]");
   if (example) {
@@ -47,4 +56,18 @@ document.addEventListener("htmx:afterSettle", () => {
   document.querySelectorAll(".run[hx-get] .log").forEach((log) => {
     log.scrollTop = log.scrollHeight;
   });
+});
+
+// Highlight the model chip that matches the Model field.
+function markModel(input) {
+  const form = input.closest("form");
+  form.querySelectorAll("[data-model]").forEach((chip) => {
+    chip.classList.toggle("on", chip.dataset.model === input.value.trim());
+  });
+}
+document.addEventListener("input", (e) => {
+  if (e.target.name === "model") markModel(e.target);
+});
+document.addEventListener("htmx:load", () => {
+  document.querySelectorAll("form [name=model]").forEach(markModel);
 });

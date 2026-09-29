@@ -9,7 +9,7 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// The config file is edited one entry at a time (an agent, a runner, a top-level setting), and
+// The config file is edited one entry at a time (an agent, a CLI's settings, a top-level setting), and
 // only that entry's lines are rewritten: the rest of the file keeps its comments, blank lines,
 // wrapping and ${NAME} references byte for byte. Re-encoding the whole document with yaml.v3
 // would not: it drops blank lines, unwraps long values and quotes some block scalars.
@@ -18,8 +18,8 @@ import (
 // as "agents".
 
 // topLevelOrder is where a new top-level key goes: before the first existing key that comes
-// after it here, so settings land above runners and runners above agents.
-var topLevelOrder = []string{"listen", "public_url", "env_file", "work_dir", "common_instructions", "runners", "agents"}
+// after it here, so settings land above the cli section and that above agents.
+var topLevelOrder = []string{"listen", "public_url", "env_file", "work_dir", "common_instructions", "cli", "agents"}
 
 // entry is one key of a section with its value.
 type entry struct {
@@ -100,8 +100,9 @@ func removeEntry(text []byte, section, key string) ([]byte, error) {
 		}
 		s := spans[i/2]
 		p.lines = slices.Delete(p.lines, s.head, s.end+1)
-		// Don't leave two blank lines where the entry was, or one under the section's key.
-		first := i == 0 && section != ""
+		// Don't leave two blank lines where the entry was, or one under the section's key (unless
+		// the section is now empty: the blank line then separates it from what follows).
+		first := i == 0 && section != "" && len(m.Content) > 2
 		if s.head < len(p.lines) && blank(p.lines[s.head]) && (first || s.head > 0 && blank(p.lines[s.head-1])) {
 			p.lines = slices.Delete(p.lines, s.head, s.head+1)
 		}
@@ -234,7 +235,12 @@ func (p *doc) put(m *yaml.Node, oldKey, key string, value *yaml.Node) ([]byte, e
 					if i == 0 {
 						p.lines = slices.Insert(p.lines, spans[0].head, append(text, "")...)
 					} else {
-						p.lines = slices.Insert(p.lines, spans[i/2-1].end+1, text...)
+						at := spans[i/2-1].end + 1
+						// A section (a mapping) set off by blank lines gets one before it too.
+						if value.Kind == yaml.MappingNode && at < len(p.lines) && blank(p.lines[at]) {
+							text = append([]string{""}, text...)
+						}
+						p.lines = slices.Insert(p.lines, at, text...)
 					}
 					return p.bytes(), nil
 				}

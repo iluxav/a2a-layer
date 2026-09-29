@@ -20,8 +20,9 @@ func init() { Register("claude", NewClaude) }
 // Claude runs tasks on Claude Code in headless mode (claude -p), under whatever login the
 // CLI already has. Each run is sealed off: no built-in tools (no shell, files or web) unless
 // the job lists them, no settings files, hooks or plugins, no saved session, and only the
-// job's MCP servers, so everything else the agent does goes through those servers. A job that keeps its session saves it
-// where claude keeps sessions for the job's work dir, and a later job resumes it there.
+// job's MCP servers, so everything else the agent does goes through those servers. A job that
+// keeps its session saves it where claude keeps sessions for the job's work dir, and a later
+// job resumes it there.
 type Claude struct {
 	opts Options
 }
@@ -35,6 +36,22 @@ func NewClaude(o Options) Runner {
 		o.KillGrace = 5 * time.Second
 	}
 	return &Claude{opts: o}
+}
+
+// Info implements Describer: claude takes permission rules.
+func (c *Claude) Info() Info {
+	return Info{ToolRules: true, RuleExamples: []string{"Bash(lspci *)", "Read", "WebFetch"}}
+}
+
+// Models implements ModelLister with the aliases claude takes for its latest models. It also
+// takes a model's full name, which it has no command to list.
+func (c *Claude) Models(context.Context) ([]Model, error) {
+	return []Model{
+		{ID: "fable", Name: "Fable", Description: "the latest Fable model"},
+		{ID: "opus", Name: "Opus", Description: "the latest Opus model"},
+		{ID: "sonnet", Name: "Sonnet", Description: "the latest Sonnet model"},
+		{ID: "haiku", Name: "Haiku", Description: "the latest Haiku model"},
+	}, nil
 }
 
 // mcpConfigFile is the --mcp-config file written into the job's work dir.

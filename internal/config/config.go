@@ -33,34 +33,29 @@ type Config struct {
 	WorkDir string `yaml:"work_dir"`
 	// CommonInstructions are appended to every agent's instructions.
 	CommonInstructions string `yaml:"common_instructions"`
-	// Runners are the command-line agents tasks run on, by name.
-	Runners map[string]Runner `yaml:"runners"`
+	// CLI adjusts how a CLI is run on this machine, by its name (claude, codex). Optional:
+	// without it each CLI runs as its own command on PATH, under its usual login.
+	CLI map[string]CLI `yaml:"cli"`
 	// Agents are served at /<name>.
 	Agents map[string]*Agent `yaml:"agents"`
 }
 
-// Runner configures one command-line agent (a CLI such as claude) that tasks run on.
-type Runner struct {
-	// Type picks the implementation (claude). Default: the runner's own name.
-	Type string `yaml:"type"`
-	// Command is the executable. Default: the implementation's usual binary name.
+// CLI is how one CLI is run, for every agent on it.
+type CLI struct {
+	// Command is the executable. Default: the CLI's name, found on PATH.
 	Command string `yaml:"command"`
-	// Model, MaxTurns and Timeout are defaults an agent can override.
-	Model    string   `yaml:"model"`
-	MaxTurns int      `yaml:"max_turns"`
-	Timeout  Duration `yaml:"timeout"`
 	// Args are extra arguments added to every run.
 	Args []string `yaml:"args"`
-	// Env is added to the runner's environment.
+	// Env is added to its environment (for example CLAUDE_CONFIG_DIR, for another login).
 	Env map[string]string `yaml:"env"`
 }
 
-// Bin is the executable the runner starts: Command, or else the implementation's name.
-func (r Runner) Bin() string {
-	if r.Command != "" {
-		return r.Command
+// Bin is the executable the CLI of that name starts.
+func (c CLI) Bin(name string) string {
+	if c.Command != "" {
+		return c.Command
 	}
-	return r.Type
+	return name
 }
 
 // Agent is one A2A agent: its card, what runs it, and the MCP servers it may use.
@@ -71,8 +66,9 @@ type Agent struct {
 	Instructions string  `yaml:"instructions"`
 	Skills       []Skill `yaml:"skills"`
 
-	// Runner names the runner (default: the only one configured).
-	Runner   string   `yaml:"runner"`
+	// CLI is the program its tasks run on: claude (the default) or codex.
+	CLI string `yaml:"cli"`
+	// Model is the CLI's model name or alias; empty uses the CLI's default.
 	Model    string   `yaml:"model"`
 	MaxTurns int      `yaml:"max_turns"`
 	Timeout  Duration `yaml:"timeout"`
@@ -83,10 +79,10 @@ type Agent struct {
 
 	// MCP are the servers the agent may use, by name.
 	MCP map[string]MCPServer `yaml:"mcp"`
-	// BuiltinTools opens the seal: the runner's own tools the agent may use, as permission
-	// rules in the CLI's syntax (for claude: Bash, Read, Bash(lspci *)), or [default] for all
-	// of them with every call allowed. They act on this machine as the user a2a-layer runs
-	// as. Default none: the agent acts only through MCP.
+	// BuiltinTools opens the seal: the CLI's own tools the agent may use, as permission rules
+	// in the CLI's syntax (for claude: Bash, Read, Bash(lspci *)), or [default] for all of
+	// them with every call allowed. They act on this machine as the user a2a-layer runs as.
+	// Default none: the agent acts only through its MCP servers.
 	BuiltinTools []string `yaml:"builtin_tools"`
 
 	// Context makes the agent remember earlier tasks of the same A2A context.
@@ -139,12 +135,12 @@ func (d *Duration) UnmarshalYAML(n *yaml.Node) error {
 	return nil
 }
 
-// Defaults applied when neither the agent nor its runner says otherwise.
+// Defaults applied when the config does not say otherwise.
 const (
 	DefaultListen   = "127.0.0.1:7300"
 	DefaultMaxTurns = 30
 	DefaultTimeout  = 15 * time.Minute
-	DefaultRunner   = "claude"
+	DefaultCLI      = "claude"
 	// A conversation ends after this long unused, and restarts its session after this many tasks.
 	DefaultContextIdle  = time.Hour
 	DefaultContextTasks = 20
@@ -200,6 +196,9 @@ func Parse(raw []byte, dir string) (*Config, error) {
 	}
 	var c Config
 	if doc.Kind != 0 { // an empty file is an empty config
+		if err := removedKeys(&doc); err != nil {
+			return nil, err
+		}
 		if err := expandNode(&doc); err != nil {
 			return nil, err
 		}
@@ -217,6 +216,32 @@ func Parse(raw []byte, dir string) (*Config, error) {
 		return nil, err
 	}
 	return &c, nil
+}
+
+// removedKeys explains the keys an older config used, rather than calling them unknown.
+func removedKeys(doc *yaml.Node) error {
+	if len(doc.Content) != 1 || doc.Content[0].Kind != yaml.MappingNode {
+		return nil
+	}
+	var errs []error
+	root := doc.Content[0]
+	for i := 0; i+1 < len(root.Content); i += 2 {
+		switch root.Content[i].Value {
+		case "runners":
+			errs = append(errs, fmt.Errorf("line %d: runners: is gone: each agent names its CLI (cli: claude or cli: codex) and sets its own model, max_turns, timeout and builtin_tools; a CLI's command, args and env go under cli: at the top", root.Content[i].Line))
+		case "agents":
+			agents := root.Content[i+1]
+			for j := 0; j+1 < len(agents.Content); j += 2 {
+				a := agents.Content[j+1]
+				for k := 0; k+1 < len(a.Content); k += 2 {
+					if a.Content[k].Value == "runner" {
+						errs = append(errs, fmt.Errorf("line %d: agent %s: runner: is now cli: (claude or codex)", a.Content[k].Line, agents.Content[j].Value))
+					}
+				}
+			}
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // expandNode expands ${NAME} in every scalar value of the document.
@@ -268,15 +293,6 @@ func (c *Config) finish(dir string) error {
 	if c.WorkDir != "" && !filepath.IsAbs(c.WorkDir) {
 		c.WorkDir = filepath.Join(dir, c.WorkDir)
 	}
-	if len(c.Runners) == 0 {
-		c.Runners = map[string]Runner{DefaultRunner: {}}
-	}
-	for name, r := range c.Runners {
-		if r.Type == "" {
-			r.Type = name
-		}
-		c.Runners[name] = r
-	}
 	var errs []error
 	for name, a := range c.Agents {
 		if a == nil {
@@ -299,29 +315,11 @@ func (c *Config) finishAgent(a *Agent) error {
 	if a.Name == "mcp-proxy" {
 		return errors.New("the name mcp-proxy is reserved (the tasks' MCP proxy lives at /mcp-proxy/)")
 	}
-	if a.Runner == "" {
-		if len(c.Runners) != 1 {
-			return errors.New("several runners are configured: say which one with runner:")
-		}
-		for name := range c.Runners {
-			a.Runner = name
-		}
-	}
-	r, ok := c.Runners[a.Runner]
-	if !ok {
-		return fmt.Errorf("runner %q is not configured", a.Runner)
-	}
-	if a.Model == "" {
-		a.Model = r.Model
-	}
-	if a.MaxTurns == 0 {
-		a.MaxTurns = r.MaxTurns
+	if a.CLI == "" {
+		a.CLI = DefaultCLI
 	}
 	if a.MaxTurns == 0 {
 		a.MaxTurns = DefaultMaxTurns
-	}
-	if a.Timeout == 0 {
-		a.Timeout = r.Timeout
 	}
 	if a.Timeout == 0 {
 		a.Timeout = Duration(DefaultTimeout)
@@ -352,13 +350,8 @@ func (c *Config) finishAgent(a *Agent) error {
 			a.Skills[i].Name = s.ID
 		}
 	}
-	for _, t := range a.BuiltinTools {
-		if strings.TrimSpace(t) == "" {
-			return errors.New("builtin_tools has an empty entry")
-		}
-		if t == "default" && len(a.BuiltinTools) > 1 {
-			return errors.New("builtin_tools: default already allows every built-in tool, so list it alone")
-		}
+	if err := checkBuiltinTools(a.BuiltinTools); err != nil {
+		return err
 	}
 	for name, m := range a.MCP {
 		if !mcpPattern.MatchString(name) {
@@ -366,6 +359,18 @@ func (c *Config) finishAgent(a *Agent) error {
 		}
 		if m.URL == "" {
 			return fmt.Errorf("mcp server %q: url is required", name)
+		}
+	}
+	return nil
+}
+
+func checkBuiltinTools(tools []string) error {
+	for _, t := range tools {
+		if strings.TrimSpace(t) == "" {
+			return errors.New("builtin_tools has an empty entry")
+		}
+		if t == "default" && len(tools) > 1 {
+			return errors.New("builtin_tools: default already allows every built-in tool, so list it alone")
 		}
 	}
 	return nil

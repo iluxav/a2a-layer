@@ -12,8 +12,8 @@ http://127.0.0.1:7300/                ← index of the agents
 ```
 
 A task runs the CLI headless with the agent's instructions, model, and MCP servers, and returns
-what it said. Claude Code is the first runner; other CLIs (Codex, Gemini, …) plug in behind the
-same interface.
+what it said. An agent runs on Claude Code (the default) or Codex; other CLIs (Gemini, …) plug in
+behind the same interface.
 
 ## Quick start
 
@@ -32,13 +32,11 @@ A minimal config:
 
 ```yaml
 listen: 127.0.0.1:7300
-runners:
-  claude:
-    model: haiku
 
 agents:
   helper:
     description: Answers questions about our docs.
+    model: haiku
     instructions: Answer briefly, citing the page you used.
     mcp:
       docs:
@@ -67,11 +65,13 @@ make dashboard CONFIG=agents.yaml
 A web UI for the config file, served from the same binary (its pages, stylesheet and htmx are
 embedded):
 
-- **Agents**: add, edit, rename and delete agents: card, instructions, runner and limits,
-  secret, conversations, MCP servers with their headers and allowed tools, and skills.
-- **Runners**: define the CLIs agents run on, with their defaults; shows whether each command is
-  on `PATH` and which agents use it.
-- **Settings**: listen address, public URL, env file, work dir and the common instructions.
+- **Agents**: add, edit, rename and delete agents: card, instructions, CLI and limits, secret,
+  conversations, MCP servers with their headers and allowed tools, built-in tools, and skills.
+  The model is picked from those the agent's CLI offers (`codex debug models` for Codex; the
+  aliases for Claude), or typed.
+- **Settings**: listen address, public URL, env file, work dir and the common instructions, and
+  (optional) how each CLI is run: its command, extra arguments and environment. It also shows
+  whether each CLI is found.
 - **Playground**: send an agent a message and follow its task as it runs: progress, answer,
   turns, tokens and cost. An agent that remembers can be continued in the same conversation.
   The agents run inside the dashboard, exactly as a2a-layer would run them, from the config as
@@ -80,7 +80,7 @@ embedded):
 Every change is written back to the file right away. Only the entry you changed is rewritten:
 the rest of the file keeps its comments, layout and `${NAME}` references, and the forms show
 values as written, so a secret stays `${PM_SECRET}`. A change that would break the config (an
-unset variable, an agent without a description, a runner that does not exist) is refused with
+unset variable, an agent without a description, a CLI that a2a-layer does not run) is refused with
 the reason; problems the file already had are shown but do not block other changes. The file
 need not exist: the first change creates it. a2a-layer reads the config when it starts, so
 restart it to serve what you changed.
@@ -134,7 +134,11 @@ agents:
   gpu:
     description: Reports on this machine's GPUs, and nothing else.
     builtin_tools: ["Bash(lspci *)", "Bash(nvidia-smi *)", "Bash(grep *)"]
+  pm:
+    description: Plans projects.     # no builtin_tools: sealed, only its MCP servers
 ```
+
+The dashboard offers the same choice on the agent form: none, all, or only the rules you list.
 
 ### Conversations
 
@@ -170,15 +174,12 @@ work_dir: /var/tmp/a2a          # where task scratch dirs go (default: system te
 common_instructions: |          # appended to every agent's instructions
   …
 
-runners:                        # the CLIs tasks run on, by name
-  claude:
-    type: claude                # implementation (default: the runner's name)
-    command: claude             # executable (default: the implementation's usual name)
-    model: haiku                # defaults an agent can override
-    max_turns: 30
-    timeout: 15m
-    args: []                    # extra CLI arguments on every run
-    env: {}                     # extra environment for the CLI
+cli:                            # optional: how a CLI is run on this machine, for all its agents
+  claude:                       # or codex
+    command: /opt/claude/bin/claude   # executable (default: the CLI's name, on PATH)
+    args: []                    # extra arguments on every run
+    env:                        # extra environment, e.g. another login
+      CLAUDE_CONFIG_DIR: /home/me/.claude-work
 
 agents:
   pm:                           # served at /pm; lowercase letters, digits, - and _
@@ -192,17 +193,17 @@ agents:
         description: …
         tags: [planning]
         examples: ["…"]
-    runner: claude              # default: the only runner configured
-    model: sonnet
-    max_turns: 60
-    timeout: 45m
+    cli: claude                 # the program its tasks run on: claude (default) or codex
+    model: sonnet               # the CLI's model name or alias (default: the CLI's default)
+    max_turns: 60               # default 30
+    timeout: 45m                # default 15m
     max_parallel: 2             # tasks beyond this wait their turn (default 1)
     context:                    # remember earlier tasks of the same A2A contextId (see Conversations)
       remember: true            # default false: every task starts from nothing
       idle_timeout: 1h          # a conversation unused this long ends (default 1h)
       max_tasks: 20             # then its session starts afresh (default 20)
     secret: ${PM_SECRET}        # callers must send "Authorization: Bearer <secret>"
-    builtin_tools: [Read]       # the CLI's own tools it may use: rules, or [default] for all (see Built-in tools)
+    builtin_tools: [Read]       # the CLI's own tools: rules, or [default] for all (default none)
     mcp:
       gateway:                  # a Streamable HTTP MCP server, by name
         url: ${GATEWAY_URL}
@@ -216,7 +217,7 @@ Any value can use `${NAME}` from the environment or `env_file`; a name that is n
 error. A bare `$` (as in "$9 a month") is left alone, and so are comments. Unknown keys are errors,
 so a typo does not silently change behaviour.
 
-Each task's metadata reports the runner, model, turns, tokens, cost and duration; the server logs
+Each task's metadata reports the CLI, model, turns, tokens, cost and duration; the server logs
 one line per task start and finish.
 
 ## Example: a team behind a consent gateway
@@ -237,11 +238,37 @@ Linear, builds on GitHub, and deploys with Vercel, with every call going through
 agent rides along on every call the agent makes back through Delegent, so the gateway shows
 `you → pm → engineer → github` as one run.
 
+## Codex
+
+Agents can run on the Codex CLI instead of Claude Code, under whatever login it has:
+
+```yaml
+agents:
+  reviewer:
+    cli: codex
+    model: …                    # a model your codex login offers; empty uses codex's default
+    description: …
+```
+
+A Codex task is sealed the same way (`codex exec --json`): your `~/.codex/config.toml`, rules,
+plugins and apps are ignored; the shell is switched off, the sandbox is read-only and web search
+is disabled, so the agent acts only through its MCP servers, whose allowed tools it calls without
+asking. Conversations work as with Claude (`codex exec resume`), and an ended one's session files
+are deleted. The differences:
+
+- `builtin_tools` takes `[default]` or nothing. `[default]` gives every Codex tool with no
+  sandbox and nothing asked (`--dangerously-bypass-approvals-and-sandbox`). Codex has no
+  permission rules like `Bash(lspci *)`: a Codex agent given some is refused when
+  a2a-layer starts, by `-check`, and by the dashboard, which offers Codex only None or All.
+- Codex has no turn limit of its own: the layer stops a task after `max_turns` tool calls.
+- Codex reports tokens but not cost.
+
 ## Adding another CLI
 
-A runner turns a job into one headless run of a CLI. To add one (say Codex):
+Inside a2a-layer, a runner turns a job into one headless run of a CLI. To add a CLI (see
+`claude.go` and `codex.go`):
 
-1. Write `internal/runner/codex.go` implementing
+1. Write `internal/runner/<cli>.go` implementing
 
    ```go
    type Runner interface {
@@ -255,22 +282,26 @@ A runner turns a job into one headless run of a CLI. To add one (say Codex):
    Keep the same seal: only the job's MCP servers, and no built-in tools but those the job's
    `BuiltinTools` rules allow.
    For conversations, report the CLI's session (or thread) id in `Result.SessionID`, and when a
-   job sets `Resume`, continue that session (for Codex, `codex exec resume <id>`); return
+   job sets `Resume`, continue that session; return
    `ErrSessionNotFound` if it no longer exists. `KeepSession` says whether to save the session
    at all. A CLI that stores sessions on disk also implements `SessionForgetter`, so an ended
-   conversation leaves nothing behind.
-2. Register it: `func init() { Register("codex", NewCodex) }`.
-3. Use it: `runners: {codex: {model: …}}` and `runner: codex` on an agent.
+   conversation leaves nothing behind. A CLI with permission rules for its built-in tools
+   implements `Describer` (`Info() Info` with `ToolRules` and example rules); one without takes
+   only `[default]` or nothing. One that can list its models implements `ModelLister`, and the
+   dashboard offers them.
+2. Register it: `func init() { Register("gemini", NewGemini) }`.
+3. Use it: `cli: gemini` on an agent.
 
 The server and config need no changes.
 
 ## Layout
 
-- `cmd/a2a-layer` – the binary: flags, runners, HTTP server, shutdown, the `dashboard` command
+- `cmd/a2a-layer` – the binary: flags, HTTP server, shutdown, the `dashboard` command
 - `internal/config` – the YAML schema, `${NAME}` expansion, defaults and validation
 - `internal/server` – A2A over HTTP: routing per agent, auth, tasks, running them
 - `internal/dashboard` – the web UI: config editing (entry by entry), the playground, embedded
   templates and assets
 - `internal/mcpproxy` – each task's filtered, private view of its MCP servers
-- `internal/runner` – the runner interface and the Claude Code implementation
+- `internal/runner` – running a task on a CLI: the interface, and the Claude Code and Codex
+  implementations
 - `internal/a2a` – the A2A wire types

@@ -25,9 +25,9 @@
     </header>
     <p class="desc">{{.Description}}</p>
     <dl class="facts">
-      <dt>Runner</dt><dd>{{or .Runner "default"}}{{with .Model}} · {{.}}{{end}}</dd>
+      <dt>CLI</dt><dd>{{.CLI}}{{with .Model}} · {{.}}{{end}}</dd>
       <dt>MCP</dt><dd>{{if .MCP}}{{join .MCP ", "}}{{else}}<span class="muted">none</span>{{end}}</dd>
-      {{with .Builtin}}<dt>Built-in</dt><dd class="mono small">{{join . ", "}}</dd>{{end}}
+      {{with .Builtin}}<dt>Built-in</dt><dd>{{if eq (join . ",") "default"}}all{{else}}<span class="mono small">{{join . ", "}}</span>{{end}}</dd>{{end}}
       {{with .URL}}<dt>URL</dt><dd><code>{{.}}</code></dd>{{end}}
     </dl>
     {{with .Problems}}<ul class="problems">{{range .}}<li>{{.}}</li>{{end}}</ul>{{end}}

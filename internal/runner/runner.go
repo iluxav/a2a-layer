@@ -13,6 +13,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"time"
 )
@@ -113,9 +114,59 @@ func Register(typ string, f Factory) { factories[typ] = f }
 func New(typ string, o Options) (Runner, error) {
 	f, ok := factories[typ]
 	if !ok {
-		return nil, fmt.Errorf("unknown runner type %q (available: %v)", typ, Types())
+		return nil, fmt.Errorf("unknown CLI %q (available: %v)", typ, Types())
 	}
 	return f(o), nil
+}
+
+// Info describes what an implementation takes, for checking a config and for forms.
+type Info struct {
+	// ToolRules says BuiltinTools may hold permission rules. Without it a runner takes only
+	// AllBuiltinTools, or nothing.
+	ToolRules bool
+	// RuleExamples are rules in the CLI's own syntax, for forms to suggest.
+	RuleExamples []string
+}
+
+// Model is a model a CLI can run, by the name it takes (Job.Model).
+type Model struct {
+	ID, Name, Description string
+}
+
+// ModelLister is implemented by runners that can say which models their CLI offers, for forms.
+type ModelLister interface {
+	Models(ctx context.Context) ([]Model, error)
+}
+
+// Describer is implemented by runners that say what they take. One that does not takes no
+// permission rules.
+type Describer interface {
+	Info() Info
+}
+
+// InfoOf describes a runner.
+func InfoOf(r Runner) Info {
+	if d, ok := r.(Describer); ok {
+		return d.Info()
+	}
+	return Info{}
+}
+
+// InfoFor describes the implementation of a type (an unknown type as taking no rules).
+func InfoFor(typ string) Info {
+	r, err := New(typ, Options{})
+	if err != nil {
+		return Info{}
+	}
+	return InfoOf(r)
+}
+
+// CheckBuiltinTools says why a runner cannot take a job's BuiltinTools.
+func CheckBuiltinTools(r Runner, tools []string) error {
+	if len(tools) == 0 || slices.Equal(tools, []string{AllBuiltinTools}) || InfoOf(r).ToolRules {
+		return nil
+	}
+	return fmt.Errorf("builtin_tools: this CLI takes [%s] or none, not permission rules like %q", AllBuiltinTools, tools[0])
 }
 
 // Types lists the registered implementations.

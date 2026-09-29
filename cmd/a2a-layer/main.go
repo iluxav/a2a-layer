@@ -12,11 +12,13 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"maps"
 	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"syscall"
 	"time"
 
@@ -68,18 +70,22 @@ func run(cfgPath string, check bool, log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	for name, rc := range cfg.Runners {
-		if _, err := exec.LookPath(rc.Bin()); err != nil {
-			log.Warn("runner command not found on PATH; tasks on it will fail", "runner", name, "command", rc.Bin())
-		}
-	}
 	srv, err := server.New(cfg, runners, log)
 	if err != nil {
 		return err
 	}
+	used := map[string]bool{}
+	for _, a := range cfg.Agents {
+		used[a.CLI] = true
+	}
+	for _, name := range slices.Sorted(maps.Keys(used)) {
+		if bin := cfg.CLI[name].Bin(name); !found(bin) {
+			log.Warn("CLI not found on PATH; tasks on it will fail", "cli", name, "command", bin)
+		}
+	}
 	for _, name := range cfg.AgentNames() {
 		a := cfg.Agents[name]
-		fmt.Printf("  %-12s %s/%s  (%s, %s)\n", name, cfg.PublicURL, name, a.Runner, orDefault(a.Model, "default model"))
+		fmt.Printf("  %-12s %s/%s  (%s, %s)\n", name, cfg.PublicURL, name, a.CLI, orDefault(a.Model, "default model"))
 	}
 	if check {
 		return nil
@@ -104,6 +110,11 @@ func run(cfgPath string, check bool, log *slog.Logger) error {
 		return err
 	}
 	return nil
+}
+
+func found(bin string) bool {
+	_, err := exec.LookPath(bin)
+	return err == nil
 }
 
 func orDefault(s, d string) string {

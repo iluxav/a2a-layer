@@ -9,6 +9,8 @@ package dashboard
 
 import (
 	"bytes"
+	"cmp"
+	"context"
 	"embed"
 	"errors"
 	"fmt"
@@ -19,15 +21,12 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"slices"
 	"strings"
 	"sync"
 	"time"
-
-	"gopkg.in/yaml.v3"
 
 	"github.com/iluxav/a2a-layer/internal/config"
 	"github.com/iluxav/a2a-layer/internal/mcpproxy"
@@ -64,22 +63,23 @@ type Dashboard struct {
 
 	edit sync.Mutex // one change to the file at a time
 
-	mu   sync.Mutex
-	play *playground   // built from the file as it was last read
-	live []*playground // play, and replaced ones whose runs have not finished
-	runs []*run        // newest first
+	mu         sync.Mutex
+	modelCache map[string]listedModels // by runner type and command
+	play       *playground             // built from the file as it was last read
+	live       []*playground           // play, and replaced ones whose runs have not finished
+	runs       []*run                  // newest first
 }
 
 // New builds the dashboard.
 func New(o Options) (*Dashboard, error) {
-	d := &Dashboard{path: o.Path, anyHost: o.AnyHost, log: o.Log, proxy: mcpproxy.New(o.BaseURL), newRunners: o.NewRunners, pages: map[string]*template.Template{}}
+	d := &Dashboard{path: o.Path, anyHost: o.AnyHost, log: o.Log, proxy: mcpproxy.New(o.BaseURL), newRunners: o.NewRunners, pages: map[string]*template.Template{}, modelCache: map[string]listedModels{}}
 	if d.log == nil {
 		d.log = slog.New(slog.DiscardHandler)
 	}
 	if d.newRunners == nil {
 		d.newRunners = server.NewRunners
 	}
-	for _, page := range []string{"agents", "agent", "runners", "runner", "settings", "playground"} {
+	for _, page := range []string{"agents", "agent", "settings", "playground"} {
 		t, err := template.New(page).Funcs(funcs).ParseFS(assets, "templates/layout.html", "templates/parts.html", "templates/"+page+".html")
 		if err != nil {
 			return nil, err
@@ -108,13 +108,8 @@ func (d *Dashboard) Handler() http.Handler {
 	mux.HandleFunc("POST /agents/{name}/delete", d.deleteAgent)
 	mux.HandleFunc("GET /agents/{name}/card", d.agentCard)
 	mux.HandleFunc("GET /parts/mcp", d.part("mcp-row", func() any { return mcpForm{Row: newRow()} }))
+	mux.HandleFunc("GET /parts/cli", d.cliPart)
 	mux.HandleFunc("GET /parts/skill", d.part("skill-row", func() any { return skillForm{Row: newRow()} }))
-
-	mux.HandleFunc("GET /runners", d.runnersPage)
-	mux.HandleFunc("GET /runners/new", d.runnerPage)
-	mux.HandleFunc("GET /runners/{name}/edit", d.runnerPage)
-	mux.HandleFunc("POST /runners", d.saveRunner)
-	mux.HandleFunc("POST /runners/{name}/delete", d.deleteRunner)
 
 	mux.HandleFunc("GET /settings", d.settingsPage)
 	mux.HandleFunc("POST /settings", d.saveSettings)
@@ -169,6 +164,21 @@ func (d *Dashboard) parse(text []byte) (*config.Config, error) {
 	return config.Parse(text, filepath.Dir(d.path))
 }
 
+// check parses the text and checks it against its runners, as a2a-layer does when it starts
+// (built-in tools a runner cannot give, for one). The config comes back when only that check
+// fails.
+func (d *Dashboard) check(text []byte) (*config.Config, error) {
+	cfg, err := d.parse(text)
+	if err != nil {
+		return nil, err
+	}
+	runners, err := d.newRunners(cfg)
+	if err != nil {
+		return cfg, err
+	}
+	return cfg, server.Check(cfg, runners)
+}
+
 // change applies edit to the file and writes the result, unless it has problems the file did not
 // have before. A file that is already broken can still be changed, as long as nothing new breaks.
 func (d *Dashboard) change(edit func(text []byte) ([]byte, error)) error {
@@ -182,8 +192,8 @@ func (d *Dashboard) change(edit func(text []byte) ([]byte, error)) error {
 	if err != nil {
 		return err
 	}
-	_, errBefore := d.parse(before)
-	_, errAfter := d.parse(after)
+	_, errBefore := d.check(before)
+	_, errAfter := d.check(after)
 	if added := newProblems(errBefore, errAfter); len(added) > 0 {
 		return &formError{added}
 	}
@@ -252,30 +262,33 @@ type view struct {
 	Flash    string
 	Error    []string // why the change just submitted was not made
 
-	Agents  []agentRow
-	Agent   agentForm
-	Runners []runnerRow
-	Runner  runnerForm
-	// RunnerNames are the runners an agent can pick; DefaultRunner is the one it gets without
-	// picking (empty when there are several).
-	RunnerNames   []string
-	DefaultRunner string
-	RunnerTypes   []string
-	Settings      settingsForm
-	Play          playView
+	Agents   []agentRow
+	Agent    agentForm
+	CLIs     []string // the CLIs an agent can run on
+	ForCLI   cliParts // the parts of the agent form that follow its CLI
+	Settings settingsForm
+	Play     playView
 }
 
 type agentRow struct {
-	Name, Description, Runner, Model, URL string
-	MCP, Builtin                          []string
-	Remember, Secret                      bool
-	Problems                              []string
+	Name, Description, CLI, Model, URL string
+	MCP, Builtin                       []string
+	Remember, Secret                   bool
+	Problems                           []string
 }
 
-type runnerRow struct {
-	Name, Type, Bin, Model, MaxTurns, Timeout string
-	Found, Implicit                           bool
-	UsedBy                                    []string
+// cliParts are the parts of the agent form that follow its CLI: the built-in tools choice, and
+// the models to pick from.
+type cliParts struct {
+	builtinForm
+	// TakesRules says the CLI takes permission rules, like Examples.
+	TakesRules bool
+	Examples   []string
+	// Models are those its CLI offers (ModelsNote says why there are none); DefaultModel is
+	// what an empty model means.
+	Models       []runner.Model
+	ModelsNote   string
+	DefaultModel string
 }
 
 // state is the file as a page shows it.
@@ -290,7 +303,7 @@ func (d *Dashboard) state() state {
 	if err != nil {
 		return state{err: err}
 	}
-	cfg, err := d.parse(text)
+	cfg, err := d.check(text)
 	return state{text: text, cfg: cfg, err: err}
 }
 
@@ -311,19 +324,6 @@ func (d *Dashboard) view(r *http.Request, tab string, st state) *view {
 		v.Flash = "Deleted " + q.Get("deleted") + "."
 	}
 	return v
-}
-
-// runnerChoices are the runners in the file, or the implicit default when there are none.
-func runnerChoices(text []byte) []string {
-	es, _ := entries(text, "runners")
-	if len(es) == 0 {
-		return []string{config.DefaultRunner}
-	}
-	var out []string
-	for _, e := range es {
-		out = append(out, e.Key)
-	}
-	return out
 }
 
 func (d *Dashboard) render(w http.ResponseWriter, page string, v *view) {
@@ -388,15 +388,10 @@ func (d *Dashboard) agentsPage(w http.ResponseWriter, r *http.Request) {
 	}
 	for _, e := range es {
 		f, err := agentFromNode(e.Key, e.Value)
-		row := agentRow{Name: e.Key, Description: f.Description, Runner: f.Runner, Model: f.Model,
+		row := agentRow{Name: e.Key, Description: f.Description, CLI: cmp.Or(f.CLI, config.DefaultCLI), Model: f.Model,
 			Remember: f.Remember, Secret: f.Secret != "", Problems: problemsOf(st.err, "agent "+e.Key+":")}
 		if err != nil {
 			row.Problems = append(row.Problems, err.Error())
-		}
-		if st.cfg != nil {
-			if a := st.cfg.Agents[e.Key]; a != nil {
-				row.Runner, row.Model = a.Runner, a.Model
-			}
 		}
 		if publicURL != "" {
 			row.URL = publicURL + "/" + e.Key
@@ -404,7 +399,7 @@ func (d *Dashboard) agentsPage(w http.ResponseWriter, r *http.Request) {
 		for _, m := range f.MCP {
 			row.MCP = append(row.MCP, m.Name)
 		}
-		row.Builtin = lines(f.BuiltinTools)
+		row.Builtin = f.Builtin.tools()
 		v.Agents = append(v.Agents, row)
 	}
 	d.render(w, "agents", v)
@@ -428,11 +423,74 @@ func (d *Dashboard) agentPage(w http.ResponseWriter, r *http.Request) {
 }
 
 func (d *Dashboard) renderAgentForm(w http.ResponseWriter, v *view, text []byte) {
-	v.RunnerNames = runnerChoices(text)
-	if len(v.RunnerNames) == 1 {
-		v.DefaultRunner = v.RunnerNames[0]
-	}
+	v.CLIs = runner.Types()
+	v.ForCLI = d.partsFor(text, v.Agent.CLI, v.Agent.Builtin)
 	d.render(w, "agent", v)
+}
+
+// partsFor are the agent form's parts for a CLI ("" for the default one).
+func (d *Dashboard) partsFor(text []byte, cli string, b builtinForm) cliParts {
+	cli = cmp.Or(cli, config.DefaultCLI)
+	if b.Mode == "" {
+		b.Mode = "none"
+	}
+	info := runner.InfoFor(cli)
+	p := cliParts{builtinForm: b, TakesRules: info.ToolRules, Examples: info.RuleExamples, DefaultModel: "the " + cli + " CLI's default"}
+	p.Models, p.ModelsNote = d.models(cli, cliSettingsIn(text, cli).Command)
+	return p
+}
+
+// modelsTTL is how long the models a CLI listed are remembered.
+const modelsTTL = 5 * time.Minute
+
+type listedModels struct {
+	at     time.Time
+	models []runner.Model
+	note   string // why there are none
+}
+
+// models are what a runner's CLI offers, or a note saying why there are none.
+func (d *Dashboard) models(typ, command string) ([]runner.Model, string) {
+	key := typ + "\x00" + command
+	d.mu.Lock()
+	l, ok := d.modelCache[key]
+	d.mu.Unlock()
+	if ok && time.Since(l.at) < modelsTTL {
+		return l.models, l.note
+	}
+	l = listedModels{at: time.Now()}
+	r, err := runner.New(typ, runner.Options{Command: command})
+	switch lister, ok := r.(runner.ModelLister); {
+	case err != nil:
+		l.note = err.Error()
+	case !ok:
+		l.note = "This CLI cannot list its models: type the name it takes"
+	default:
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		l.models, err = lister.Models(ctx)
+		cancel()
+		if err != nil {
+			l.note = "Could not list its models (" + err.Error() + ")"
+		} else if len(l.models) == 0 {
+			l.note = "It lists no models"
+		}
+	}
+	d.mu.Lock()
+	d.modelCache[key] = l
+	d.mu.Unlock()
+	return l.models, l.note
+}
+
+// cliPart re-renders the agent form's parts for its CLI when the CLI changes, keeping what
+// was chosen.
+func (d *Dashboard) cliPart(w http.ResponseWriter, r *http.Request) {
+	text, err := d.read()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	q := r.URL.Query()
+	d.renderPart(w, "cli-parts", d.partsFor(text, q.Get("cli"), builtinFromForm(q)))
 }
 
 func (d *Dashboard) saveAgent(w http.ResponseWriter, r *http.Request) {
@@ -488,147 +546,6 @@ func (d *Dashboard) agentCard(w http.ResponseWriter, r *http.Request) {
 	pg.srv.Handler().ServeHTTP(w, r2)
 }
 
-// Runners.
-
-func (d *Dashboard) runnersPage(w http.ResponseWriter, r *http.Request) {
-	st := d.state()
-	v := d.view(r, "runners", st)
-	es, _ := entries(st.text, "runners")
-	if len(es) == 0 {
-		es = []entry{{Key: config.DefaultRunner}}
-	}
-	for _, e := range es {
-		f, _ := runnerFromNode(e.Key, e.Value)
-		rc := config.Runner{Type: f.Type, Command: f.Command}
-		if rc.Type == "" {
-			rc.Type = e.Key
-		}
-		row := runnerRow{Name: e.Key, Type: rc.Type, Bin: rc.Bin(), Model: f.Model, MaxTurns: f.MaxTurns, Timeout: f.Timeout, Implicit: e.Value == nil}
-		_, err := exec.LookPath(row.Bin)
-		row.Found = err == nil
-		if st.cfg != nil {
-			for _, name := range st.cfg.AgentNames() {
-				if st.cfg.Agents[name].Runner == e.Key {
-					row.UsedBy = append(row.UsedBy, name)
-				}
-			}
-		}
-		v.Runners = append(v.Runners, row)
-	}
-	d.render(w, "runners", v)
-}
-
-func (d *Dashboard) runnerPage(w http.ResponseWriter, r *http.Request) {
-	st := d.state()
-	v := d.view(r, "runners", st)
-	v.RunnerTypes = runner.Types()
-	v.Runner = runnerForm{Type: config.DefaultRunner}
-	if name := r.PathValue("name"); name != "" {
-		n, err := entryValue(st.text, "runners", name)
-		if err != nil || (n == nil && name != config.DefaultRunner) {
-			http.NotFound(w, r)
-			return
-		}
-		v.Runner, err = runnerFromNode(name, n)
-		if err != nil {
-			v.Error = []string{err.Error()}
-		}
-		if n == nil {
-			v.Runner.Original = "" // the implicit default: saving writes it
-		}
-		if v.Runner.Type == "" {
-			v.Runner.Type = name
-		}
-	}
-	d.render(w, "runner", v)
-}
-
-func (d *Dashboard) saveRunner(w http.ResponseWriter, r *http.Request) {
-	r.ParseForm()
-	f, err := runnerFromForm(r.PostForm)
-	if err == nil {
-		err = d.change(func(text []byte) ([]byte, error) { return putRunner(text, f) })
-	}
-	if err != nil {
-		v := d.view(r, "runners", d.state())
-		v.RunnerTypes = runner.Types()
-		v.Runner, v.Error = f, errorLines(err)
-		d.render(w, "runner", v)
-		return
-	}
-	d.log.Info("runner saved", "runner", f.Name)
-	done(w, r, "/runners?saved="+f.Name)
-}
-
-// putRunner writes a runner, keeping every agent on the runner it had: agents that name a
-// renamed runner follow it, and agents that relied on its being the only one name it once
-// there are several.
-func putRunner(text []byte, f runnerForm) ([]byte, error) {
-	if f.Name != f.Original {
-		if n, _ := entryValue(text, "runners", f.Name); n != nil {
-			return nil, fmt.Errorf("there is already a runner named %s", f.Name)
-		}
-	}
-	before := runnerChoices(text)
-	var err error
-	if es, _ := entries(text, "runners"); len(es) == 0 && f.Name != config.DefaultRunner {
-		// Without runners the agents run on the implicit default; keep it beside the new one.
-		if text, err = putEntry(text, "runners", "", config.DefaultRunner, &yaml.Node{Kind: yaml.MappingNode}); err != nil {
-			return nil, err
-		}
-	}
-	old, err := entryValue(text, "runners", f.Original)
-	if err != nil {
-		return nil, err
-	}
-	if text, err = putEntry(text, "runners", f.Original, f.Name, f.node(old)); err != nil {
-		return nil, err
-	}
-	after := runnerChoices(text)
-	agents, err := entries(text, "agents")
-	if err != nil {
-		return nil, err
-	}
-	for _, a := range agents {
-		var raw struct {
-			Runner string `yaml:"runner"`
-		}
-		a.Value.Decode(&raw)
-		want := raw.Runner
-		switch {
-		case raw.Runner != "" && raw.Runner == f.Original:
-			want = f.Name
-		case raw.Runner == "" && len(before) == 1 && len(after) > 1:
-			want = before[0]
-			if want == f.Original {
-				want = f.Name
-			}
-		}
-		if want == raw.Runner {
-			continue
-		}
-		setScalar(a.Value, "runner", want, strNode)
-		if text, err = putEntry(text, "agents", a.Key, a.Key, a.Value); err != nil {
-			return nil, err
-		}
-	}
-	return text, nil
-}
-
-func (d *Dashboard) deleteRunner(w http.ResponseWriter, r *http.Request) {
-	name := r.PathValue("name")
-	err := d.change(func(text []byte) ([]byte, error) { return removeEntry(text, "runners", name) })
-	if err != nil {
-		st := d.state()
-		v := d.view(r, "runners", st)
-		v.Error = errorLines(err)
-		d.render(w, "runners", v)
-		return
-	}
-	d.log.Info("runner deleted", "runner", name)
-	done(w, r, "/runners?deleted="+name)
-}
-
 // Settings.
 
 func (d *Dashboard) settingsPage(w http.ResponseWriter, r *http.Request) {
@@ -640,29 +557,10 @@ func (d *Dashboard) settingsPage(w http.ResponseWriter, r *http.Request) {
 
 func (d *Dashboard) saveSettings(w http.ResponseWriter, r *http.Request) {
 	r.ParseForm()
-	s := settingsFromForm(r.PostForm)
-	err := d.change(func(text []byte) ([]byte, error) {
-		have, err := settingsFromText(text)
-		if err != nil {
-			return nil, err
-		}
-		old := have.values()
-		for i, kv := range s.values() {
-			key, val := kv[0], kv[1]
-			switch {
-			case val == block(old[i][1]):
-				continue // unchanged: keep it as written
-			case val == "":
-				text, err = removeEntry(text, "", key)
-			default:
-				text, err = putEntry(text, "", key, key, strNode(val))
-			}
-			if err != nil {
-				return nil, err
-			}
-		}
-		return text, nil
-	})
+	s, err := settingsFromForm(r.PostForm)
+	if err == nil {
+		err = d.change(func(text []byte) ([]byte, error) { return putSettings(text, s) })
+	}
 	if err != nil {
 		v := d.view(r, "settings", d.state())
 		v.Settings, v.Error = s, errorLines(err)
@@ -696,12 +594,12 @@ type playView struct {
 
 // playAgent is an agent as the playground describes it.
 type playAgent struct {
-	Name, Description, Runner, Model, URL, Timeout string
-	MaxTurns                                       int
-	Remember, Secret                               bool
-	MCP                                            []playMCP
-	Builtin                                        []string
-	Examples                                       []string
+	Name, Description, CLI, Model, URL, Timeout string
+	MaxTurns                                    int
+	Remember, Secret                            bool
+	MCP                                         []playMCP
+	Builtin                                     []string
+	Examples                                    []string
 }
 
 type playMCP struct {
@@ -714,7 +612,7 @@ func describe(cfg *config.Config, name string) *playAgent {
 	if a == nil {
 		return nil
 	}
-	p := &playAgent{Name: name, Description: a.Description, Runner: a.Runner, Model: a.Model, URL: cfg.PublicURL + "/" + name,
+	p := &playAgent{Name: name, Description: a.Description, CLI: a.CLI, Model: a.Model, URL: cfg.PublicURL + "/" + name,
 		Timeout: shortDuration(time.Duration(a.Timeout)), MaxTurns: a.MaxTurns, Remember: a.Context.Remember, Secret: a.Secret != "",
 		Builtin: a.BuiltinTools}
 	for _, s := range a.Skills {

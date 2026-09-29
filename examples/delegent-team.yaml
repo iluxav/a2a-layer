@@ -12,12 +12,6 @@
 listen: 127.0.0.1:7300
 env_file: .env
 
-runners:
-  claude:
-    model: haiku
-    max_turns: 30
-    timeout: 20m
-
 common_instructions: |
   How you work:
   - Every tool you have comes through Delegent. A service's tools are named
@@ -90,6 +84,8 @@ agents:
 
   designer:
     description: Designer. Writes the team's design language and reviews built pages against it.
+    model: haiku
+    timeout: 20m
     secret: ${DESIGNER_SECRET}
     context:
       remember: true             # tasks in one Delegent run share a conversation
@@ -159,6 +155,8 @@ agents:
 
   qa:
     description: QA. Tests a build against its Linear story, files bugs, and passes or fails it.
+    model: haiku
+    timeout: 20m
     secret: ${QA_SECRET}
     context:
       remember: true             # tasks in one Delegent run share a conversation
@@ -189,6 +187,8 @@ agents:
 
   devops:
     description: DevOps. Deploys a GitHub repository to Vercel and checks the site is up.
+    model: haiku
+    timeout: 20m
     secret: ${DEVOPS_SECRET}
     context:
       remember: true             # tasks in one Delegent run share a conversation

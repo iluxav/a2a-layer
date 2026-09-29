@@ -60,10 +60,14 @@ func WithProxy(p *mcpproxy.Proxy) Option {
 	return func(s *Server) { s.proxy = p }
 }
 
-// New builds the server. runners maps each configured runner name to its implementation.
+// New builds the server. runners maps each CLI's name (claude, codex) to the runner that runs
+// it; see NewRunners.
 func New(cfg *config.Config, runners map[string]runner.Runner, log *slog.Logger, opts ...Option) (*Server, error) {
 	if log == nil {
 		log = slog.New(slog.NewTextHandler(io.Discard, nil))
+	}
+	if err := Check(cfg, runners); err != nil {
+		return nil, err
 	}
 	ctx, stop := context.WithCancel(context.Background())
 	s := &Server{cfg: cfg, agents: map[string]*agent{}, tasks: newStore(), convs: newConversations(), log: log, ctx: ctx, stop: stop}
@@ -75,11 +79,7 @@ func New(cfg *config.Config, runners map[string]runner.Runner, log *slog.Logger,
 	}
 	for _, name := range cfg.AgentNames() {
 		a := cfg.Agents[name]
-		r, ok := runners[a.Runner]
-		if !ok {
-			stop()
-			return nil, fmt.Errorf("agent %s: runner %q is not built", name, a.Runner)
-		}
+		r := runners[a.CLI]
 		prompt := strings.TrimSpace(a.Instructions)
 		if c := strings.TrimSpace(cfg.CommonInstructions); c != "" {
 			prompt = strings.TrimSpace(prompt + "\n\n" + c)
@@ -157,13 +157,39 @@ func cardFor(publicURL string, a *config.Agent) a2a.AgentCard {
 	return c
 }
 
-// NewRunners builds the implementation of each runner in the config, by name.
+// Check reports what the config asks that its CLIs cannot do: a CLI a2a-layer does not run,
+// or built-in tools a CLI does not take (such as permission rules on one without them).
+func Check(cfg *config.Config, runners map[string]runner.Runner) error {
+	known := strings.Join(slices.Sorted(maps.Keys(runners)), ", ")
+	var errs []error
+	for _, name := range slices.Sorted(maps.Keys(cfg.CLI)) {
+		if runners[name] == nil {
+			errs = append(errs, fmt.Errorf("cli %s: not a CLI a2a-layer runs (%s)", name, known))
+		}
+	}
+	for _, name := range cfg.AgentNames() {
+		a := cfg.Agents[name]
+		r := runners[a.CLI]
+		if r == nil {
+			errs = append(errs, fmt.Errorf("agent %s: cli %q is not one a2a-layer runs (%s)", name, a.CLI, known))
+			continue
+		}
+		if err := runner.CheckBuiltinTools(r, a.BuiltinTools); err != nil {
+			errs = append(errs, fmt.Errorf("agent %s: cli %s: %w", name, a.CLI, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// NewRunners builds a runner for every CLI a2a-layer knows, each as the config's cli section
+// says to run it.
 func NewRunners(cfg *config.Config) (map[string]runner.Runner, error) {
 	runners := map[string]runner.Runner{}
-	for name, rc := range cfg.Runners {
-		r, err := runner.New(rc.Type, runner.Options{Command: rc.Command, Args: rc.Args, Env: rc.Env})
+	for _, name := range runner.Types() {
+		c := cfg.CLI[name]
+		r, err := runner.New(name, runner.Options{Command: c.Command, Args: c.Args, Env: c.Env})
 		if err != nil {
-			return nil, fmt.Errorf("runner %s: %w", name, err)
+			return nil, err
 		}
 		runners[name] = r
 	}
@@ -331,7 +357,7 @@ func (s *Server) start(a *agent, msg a2a.Message, prompt string, inbound http.He
 	t := &task{
 		id: newID(), contextID: contextID, agent: a.cfg.Name, request: msg,
 		state: a2a.StateSubmitted, updated: time.Now(), cancel: cancel, done: make(chan struct{}),
-		metadata: map[string]any{"runner": a.cfg.Runner, "model": a.cfg.Model},
+		metadata: map[string]any{"cli": a.cfg.CLI, "model": a.cfg.Model},
 	}
 	t.request.TaskID, t.request.ContextID = t.id, contextID
 	if t.request.Kind == "" {

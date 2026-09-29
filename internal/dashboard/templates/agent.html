@@ -32,20 +32,24 @@
   <fieldset>
     <legend>Running</legend>
     <div class="grid">
-      <label>Runner
-        <select name="runner">
-          <option value="">{{with $.DefaultRunner}}default ({{.}}){{else}}pick one…{{end}}</option>
-          {{range $.RunnerNames}}<option value="{{.}}"{{if eq . $.Agent.Runner}} selected{{end}}>{{.}}</option>{{end}}
-        </select></label>
-      <label>Model <input name="model" value="{{.Model}}" list="models" placeholder="the runner's"></label>
-      <label>Max turns <input name="max_turns" value="{{.MaxTurns}}" inputmode="numeric" placeholder="the runner's, or 30"></label>
-      <label>Timeout <input name="timeout" value="{{.Timeout}}" placeholder="the runner's, or 15m"></label>
+      <label>CLI
+        <select name="cli" hx-get="/parts/cli" hx-trigger="change" hx-target="#builtin" hx-swap="outerHTML"
+                hx-include="[name=builtin_mode]:checked, [name=builtin_tools]">
+          {{range $.CLIs}}<option value="{{.}}"{{if eq . (or $.Agent.CLI "claude")}} selected{{end}}>{{.}}</option>{{end}}
+        </select>
+        <small>The program its tasks run on.</small></label>
+      <div class="field span2">
+        <label for="agent-model">Model</label>
+        <input id="agent-model" name="model" value="{{.Model}}" list="model-list" placeholder="the CLI's default" autocomplete="off" spellcheck="false">
+        {{template "model-picker" $.ForCLI}}
+      </div>
+      <label>Max turns <input name="max_turns" value="{{.MaxTurns}}" inputmode="numeric" placeholder="30"></label>
+      <label>Timeout <input name="timeout" value="{{.Timeout}}" placeholder="15m"></label>
       <label>Max parallel <input name="max_parallel" value="{{.MaxParallel}}" inputmode="numeric" placeholder="1">
         <small>Tasks beyond this wait their turn.</small></label>
       <label>Secret <input name="secret" value="{{.Secret}}" placeholder="${PM_SECRET}" autocomplete="off" spellcheck="false">
         <small>Callers send it as a bearer token. <code>${NAME}</code> reads the environment or env file.</small></label>
     </div>
-    <datalist id="models"><option value="haiku"><option value="sonnet"><option value="opus"></datalist>
   </fieldset>
 
   <fieldset>
@@ -69,12 +73,8 @@
 
   <fieldset>
     <legend>Built-in tools</legend>
-    <p class="hint">None by default, so the agent acts only through its MCP servers. Tools listed here
-      are the CLI's own (shell, files, web) and <strong>act on this machine</strong>, as the user a2a-layer runs as.</p>
-    <label class="wide"><textarea name="builtin_tools" rows="3" class="mono" spellcheck="false" placeholder="Bash(lspci *)&#10;Read">{{.BuiltinTools}}</textarea>
-      <small><code>default</code> alone gives every built-in tool with every call allowed, like approving each one.
-        Or one permission rule per line: a whole tool (<code>Bash</code>, <code>Read</code>, <code>WebFetch</code>) or a narrower rule
-        (<code>Bash(lspci *)</code> allows only commands starting with <code>lspci</code>); anything not listed is refused.</small></label>
+    <p class="hint">The CLI's own tools (shell, files, web). They <strong>act on this machine</strong>, as the user a2a-layer runs as.</p>
+    {{template "builtin-control" $.ForCLI}}
   </fieldset>
 
   <fieldset>

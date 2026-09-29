@@ -321,7 +321,7 @@ legend + * { clear: left; }
 .grid .span2 { grid-column: span 2; }
 .grid .wide { grid-column: 1 / -1; }
 
-label {
+label, .field {
   display: flex;
   flex-direction: column;
   gap: 5px;
@@ -329,10 +329,14 @@ label {
   font-size: 13px;
   min-width: 0;
 }
-label small { font-weight: 400; color: var(--muted); font-size: 12px; }
+label small, .field small { font-weight: 400; color: var(--muted); font-size: 12px; }
+.models { display: flex; flex-direction: column; gap: 6px; }
+.model-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.chip.model { font-family: var(--mono); font-size: 12px; padding: 2px 9px; }
+.chip.model.on { background: var(--accent); color: var(--accent-text); }
 label.check { flex-direction: row; align-items: center; gap: 8px; margin-bottom: 12px; font-weight: 400; font-size: 14px; }
 
-input:not([type=checkbox]), select, textarea {
+input:not([type=checkbox], [type=radio]), select, textarea {
   width: 100%;
   padding: 7px 10px;
   border: 1px solid var(--border-strong);
@@ -341,7 +345,7 @@ input:not([type=checkbox]), select, textarea {
   color: var(--text);
   font: 14px/1.45 var(--sans);
 }
-input:not([type=checkbox]), select { height: 34px; }
+input:not([type=checkbox], [type=radio]), select { height: 34px; }
 textarea { resize: vertical; }
 textarea.mono, input.mono { font-family: var(--mono); font-size: 13px; }
 input:focus, select:focus, textarea:focus {
@@ -350,7 +354,17 @@ input:focus, select:focus, textarea:focus {
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 22%, transparent);
 }
 input::placeholder, textarea::placeholder { color: color-mix(in srgb, var(--muted) 75%, transparent); }
-input[type=checkbox] { width: 16px; height: 16px; accent-color: var(--accent); }
+input[type=checkbox], input[type=radio] { width: 16px; height: 16px; margin: 0; flex: none; accent-color: var(--accent); }
+
+.builtin { display: flex; flex-direction: column; }
+.builtin label.check { margin-bottom: 8px; }
+.builtin .rules { display: none; margin: 2px 0 0 24px; }
+.builtin > small { margin-left: 24px; }
+details.cli { padding: 10px 0; border-top: 1px solid var(--border); }
+details.cli:first-of-type { border-top: 0; }
+details.cli > summary { color: var(--text); font-weight: 400; }
+details.cli[open] > summary { margin-bottom: 12px; }
+.builtin:has(input[value=rules]:checked) .rules { display: flex; }
 
 .rows { display: flex; flex-direction: column; gap: 12px; }
 .rows:not(:empty) { margin-bottom: 12px; }

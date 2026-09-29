@@ -27,7 +27,7 @@ func runDashboard(args []string, log *slog.Logger) error {
 	listen := fs.String("listen", "127.0.0.1:7301", "where to serve the dashboard")
 	fs.Usage = func() {
 		fmt.Fprintf(fs.Output(), "usage: a2a-layer dashboard [-config agents.yaml] [-listen 127.0.0.1:7301]\n\n"+
-			"Serves a web UI to add, edit and remove the config's agents and runners, and a playground\n"+
+			"Serves a web UI to add, edit and remove the config's agents, change its settings, and a playground\n"+
 			"that runs them. It has no login: keep it on a loopback address.\n\n")
 		fs.PrintDefaults()
 	}

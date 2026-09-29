@@ -23,10 +23,9 @@ func TestLoadExpandsEnvAndAppliesDefaults(t *testing.T) {
 	t.Setenv("GATEWAY_URL", "http://gw/mcp")
 	p := write(t, dir, "agents.yaml", `
 env_file: .env
-runners:
+cli:
   claude:
-    model: haiku
-    timeout: 5m
+    command: /opt/claude/bin/claude
 agents:
   pm:
     description: Plans things.
@@ -42,6 +41,8 @@ agents:
         tools: [linear__save_issue]
   qa:
     description: Tests things.
+    cli: codex
+    timeout: 5m
 `)
 	c, err := Load(p)
 	if err != nil {
@@ -51,7 +52,7 @@ agents:
 		t.Errorf("listen %q, public %q", c.Listen, c.PublicURL)
 	}
 	pm := c.Agents["pm"]
-	if pm.Name != "pm" || pm.Runner != "claude" || pm.Model != "sonnet" || pm.Secret != "s3cret" {
+	if pm.Name != "pm" || pm.CLI != "claude" || pm.Model != "sonnet" || pm.Secret != "s3cret" {
 		t.Errorf("pm = %+v", pm)
 	}
 	if pm.Instructions != "Pricing is $9 a month." {
@@ -64,8 +65,11 @@ agents:
 		t.Errorf("url = %q", pm.MCP["gateway"].URL)
 	}
 	qa := c.Agents["qa"]
-	if qa.Model != "haiku" || time.Duration(qa.Timeout) != 5*time.Minute || qa.MaxTurns != DefaultMaxTurns || qa.MaxParallel != 1 {
-		t.Errorf("qa did not inherit the runner defaults: %+v", qa)
+	if qa.CLI != "codex" || qa.Model != "" || time.Duration(qa.Timeout) != 5*time.Minute || qa.MaxTurns != DefaultMaxTurns || qa.MaxParallel != 1 {
+		t.Errorf("qa defaults: %+v", qa)
+	}
+	if c.CLI["claude"].Bin("claude") != "/opt/claude/bin/claude" || c.CLI["codex"].Bin("codex") != "codex" {
+		t.Errorf("cli settings: %+v", c.CLI)
 	}
 	if qa.Context.Remember || time.Duration(qa.Context.IdleTimeout) != DefaultContextIdle || qa.Context.MaxTasks != DefaultContextTasks {
 		t.Errorf("qa context defaults: %+v", qa.Context)
@@ -83,7 +87,8 @@ func TestLoadRejects(t *testing.T) {
 		"not set in the environment": "agents:\n  pm:\n    description: x\n    secret: ${SURELY_NOT_SET_ANYWHERE}\n",
 		"URL path":                   "agents:\n  Bad Name:\n    description: x\n",
 		"description is required":    "agents:\n  pm: {}\n",
-		`runner "codex"`:             "agents:\n  pm:\n    description: x\n    runner: codex\n",
+		"runner: is now cli:":        "agents:\n  pm:\n    description: x\n    runner: codex\n",
+		"runners: is gone":           "runners:\n  claude: {model: haiku}\nagents:\n  pm:\n    description: x\n",
 		"url is required":            "agents:\n  pm:\n    description: x\n    mcp:\n      gw: {}\n",
 		"field modle not found":      "agents:\n  pm:\n    description: x\n    modle: haiku\n",
 		"no agents":                  "listen: 127.0.0.1:1\n",
@@ -117,8 +122,8 @@ func TestParseAcceptsAConfigWithoutAgents(t *testing.T) {
 			t.Errorf("%q: %v", body, err)
 			continue
 		}
-		if len(c.Agents) != 0 || c.Runners[DefaultRunner].Type != DefaultRunner {
-			t.Errorf("%q: agents %v, runners %v", body, c.Agents, c.Runners)
+		if len(c.Agents) != 0 {
+			t.Errorf("%q: agents %v", body, c.Agents)
 		}
 	}
 }

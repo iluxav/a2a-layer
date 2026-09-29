@@ -114,11 +114,10 @@ func newTestServerWith(t *testing.T, f *fakeRunner, maxParallel int, gatewayURL 
 		PublicURL:          "http://agents.local:7300",
 		WorkDir:            t.TempDir(),
 		CommonInstructions: "Be brief.",
-		Runners:            map[string]config.Runner{"claude": {Type: "claude"}},
 		Agents: map[string]*config.Agent{
 			"pm": {
 				Name: "pm", Description: "Plans.", Version: "1.0.0", Instructions: "You are the PM.",
-				Runner: "claude", Model: "haiku", MaxTurns: 9, Timeout: config.Duration(time.Minute),
+				CLI: "claude", Model: "haiku", MaxTurns: 9, Timeout: config.Duration(time.Minute),
 				MaxParallel: maxParallel, Secret: "s3cret",
 				Skills: []config.Skill{{ID: "plan_project", Name: "Plan", Description: "Plans a project."}},
 				MCP: map[string]config.MCPServer{"gw": {
@@ -126,7 +125,7 @@ func newTestServerWith(t *testing.T, f *fakeRunner, maxParallel int, gatewayURL 
 					ForwardHeaders: []string{"X-Parent-Session"}, Tools: []string{"linear__get_issue", "linear__gone"},
 				}},
 			},
-			"open": {Name: "open", Description: "No secret.", Version: "1.0.0", Runner: "claude", MaxTurns: 3, Timeout: config.Duration(time.Minute), MaxParallel: 1,
+			"open": {Name: "open", Description: "No secret.", Version: "1.0.0", CLI: "claude", MaxTurns: 3, Timeout: config.Duration(time.Minute), MaxParallel: 1,
 				Skills: []config.Skill{{ID: "open", Name: "open", Description: "Open."}}},
 		},
 	}
@@ -389,4 +388,23 @@ func TestRPCErrors(t *testing.T) {
 	if r := call(t, ts.URL+"/open", "", "tasks/get", map[string]any{"id": task.ID}, nil); r.Error == nil || r.Error.Code != a2a.CodeTaskNotFound {
 		t.Errorf("cross-agent read: %+v", r.Error)
 	}
+}
+
+func TestARunnerIsNotAskedForToolsItCannotGive(t *testing.T) {
+	cfg := &config.Config{Listen: "127.0.0.1:0",
+		Agents: map[string]*config.Agent{"pc": {Name: "pc", Description: "x", CLI: "codex", MaxParallel: 1, BuiltinTools: []string{"Bash(lspci *)"}}}}
+	runners := map[string]runner.Runner{"codex": runner.NewCodex(runner.Options{})}
+	if _, err := New(cfg, runners, nil); err == nil || !strings.Contains(err.Error(), "agent pc: cli codex: builtin_tools") {
+		t.Errorf("err = %v", err)
+	}
+	cfg.Agents["pc"].CLI = "gemini"
+	if _, err := New(cfg, runners, nil); err == nil || !strings.Contains(err.Error(), `agent pc: cli "gemini" is not one a2a-layer runs (codex)`) {
+		t.Errorf("err = %v", err)
+	}
+	cfg.Agents["pc"].CLI, cfg.Agents["pc"].BuiltinTools = "codex", []string{runner.AllBuiltinTools}
+	s, err := New(cfg, runners, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Shutdown()
 }

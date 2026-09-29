@@ -34,11 +34,42 @@
 </div>
 {{end}}
 
+{{define "builtin-control"}}
+<div class="builtin" id="builtin">
+  <label class="check"><input type="radio" name="builtin_mode" value="none"{{if eq .Mode "none"}} checked{{end}}>
+    None: it acts only through its MCP servers</label>
+  <label class="check"><input type="radio" name="builtin_mode" value="all"{{if eq .Mode "all"}} checked{{end}}>
+    All: every built-in tool, every call allowed</label>
+  {{if or .TakesRules (eq .Mode "rules")}}
+  <label class="check"><input type="radio" name="builtin_mode" value="rules"{{if eq .Mode "rules"}} checked{{end}}>
+    Only these</label>
+  <label class="rules"><textarea name="builtin_tools" rows="3" class="mono" spellcheck="false" placeholder="{{join .Examples "\n"}}">{{.Rules}}</textarea>
+    {{if .TakesRules}}<small>One permission rule per line{{with .Examples}}, such as {{range $i, $e := .}}{{if $i}}, {{end}}<code>{{$e}}</code>{{end}}{{end}}.
+      A rule allows a whole tool, or only the calls it matches; anything else is refused.</small>
+    {{else}}<small class="err-text">This CLI takes no permission rules: pick None or All.</small>{{end}}</label>
+  {{else}}
+  <small class="muted">This CLI takes no permission rules, only None or All.</small>
+  {{end}}
+</div>
+{{end}}
+
+{{define "model-picker"}}
+<div class="models" id="models" hx-swap-oob="true">
+  <datalist id="model-list">{{range .Models}}<option value="{{.ID}}">{{with .Name}}{{.}}{{end}}{{with .Description}}: {{.}}{{end}}</option>{{end}}</datalist>
+  {{with .Models}}<div class="model-chips">{{range .}}<button type="button" class="chip model" data-model="{{.ID}}"
+    title="{{with .Name}}{{.}}{{end}}{{with .Description}}: {{.}}{{end}}">{{.ID}}</button>{{end}}</div>{{end}}
+  <small>{{with .ModelsNote}}{{.}}. {{end}}Empty: {{.DefaultModel}}.</small>
+</div>
+{{end}}
+
+{{/* What the agent form swaps in when its CLI changes: the built-in tools choice, and (out of band) the models. */}}
+{{define "cli-parts"}}{{template "builtin-control" .}}{{template "model-picker" .}}{{end}}
+
 {{define "agent-info"}}{{with .}}
 <div class="agent-info">
   <p>{{.Description}}</p>
   <dl class="facts">
-    <dt>Runs on</dt><dd>{{.Runner}}{{with .Model}} · {{.}}{{end}} · up to {{.MaxTurns}} turns in {{.Timeout}}</dd>
+    <dt>Runs on</dt><dd>{{.CLI}}{{with .Model}} · {{.}}{{end}} · up to {{.MaxTurns}} turns in {{.Timeout}}</dd>
     <dt>Tools</dt><dd>{{range .MCP}}<div><strong>{{.Name}}</strong>: {{if .Tools}}<span class="mono small">{{join .Tools ", "}}</span>{{else}}every tool it offers{{end}}</div>{{end}}
       {{- with .Builtin}}<div><strong>built-in</strong>: {{if eq (join . ",") "default"}}every tool, every call allowed{{else}}<span class="mono small">{{join . ", "}}</span>{{end}}</div>{{end}}
       {{- if and (not .MCP) (not .Builtin)}}<span class="err-text">none</span>: it can only answer from what it knows, and cannot run or read anything.

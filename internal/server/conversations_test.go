@@ -74,7 +74,7 @@ func newConvServer(t *testing.T, f *sessionRunner, maxTasks, maxParallel int) (*
 	}
 	agent := func(name string, remember bool) *config.Agent {
 		return &config.Agent{
-			Name: name, Description: "Remembers.", Version: "1", Runner: "claude", MaxTurns: 3,
+			Name: name, Description: "Remembers.", Version: "1", CLI: "claude", MaxTurns: 3,
 			Timeout: config.Duration(time.Minute), MaxParallel: maxParallel,
 			Skills:  []config.Skill{{ID: name, Name: name, Description: name}},
 			Context: config.Context{Remember: remember, IdleTimeout: config.Duration(time.Hour), MaxTasks: maxTasks},
@@ -82,8 +82,7 @@ func newConvServer(t *testing.T, f *sessionRunner, maxTasks, maxParallel int) (*
 	}
 	cfg := &config.Config{
 		Listen: ln.Addr().String(), PublicURL: "http://agents.local", WorkDir: t.TempDir(),
-		Runners: map[string]config.Runner{"claude": {Type: "claude"}},
-		Agents:  map[string]*config.Agent{"mem": agent("mem", true), "plain": agent("plain", false)},
+		Agents: map[string]*config.Agent{"mem": agent("mem", true), "plain": agent("plain", false)},
 	}
 	s, err := New(cfg, map[string]runner.Runner{"claude": f}, nil)
 	if err != nil {
