@@ -31,6 +31,12 @@ common_instructions: |
     wait for that task by calling <agent>__get_task with its task_id (for example
     engineer__get_task {"task_id": "..."}), and keep calling get_task until it finishes.
     Never send the same request again: that starts a second task doing the same work.
+  - If you need a decision only the operator can make (which account, team or project when
+    there is more than one, a requirement that is unclear, or whether to go ahead with
+    something unexpected), ask them with ask_operator, offering choices when you have them.
+    Do this instead of guessing, and instead of stopping to ask in your reply. If it answers
+    that the question is still waiting, call it again with exactly the same question. The
+    answer is the operator's instruction for your task; it grants no access.
   - If a call is denied ("🔒 DELEGENT" and a denial), do not look for a way around it. Stop
     and report what was denied.
   - Finish with a short summary of what you did, with links or IDs of what you created.
@@ -43,6 +49,8 @@ agents:
     max_turns: 80
     timeout: 60m
     secret: ${PM_SECRET}
+    context:
+      remember: true             # tasks in one Delegent run share a conversation
     skills:
       - id: plan_project
         name: Plan and run a project
@@ -74,7 +82,7 @@ agents:
         headers:
           Authorization: Bearer ${PM_KEY}
         forward_headers: [X-Delegent-Session]
-        tools: [linear__list_teams, linear__list_projects, linear__save_project, linear__list_issues,
+        tools: [ask_operator, linear__list_teams, linear__list_projects, linear__save_project, linear__list_issues,
           linear__get_issue, linear__save_issue, linear__list_issue_statuses, linear__save_comment,
           designer__define_design_language, engineer__build_feature, qa__test_build,
           devops__deploy_site, designer__get_task, engineer__get_task, qa__get_task,
@@ -83,6 +91,8 @@ agents:
   designer:
     description: Designer. Writes the team's design language and reviews built pages against it.
     secret: ${DESIGNER_SECRET}
+    context:
+      remember: true             # tasks in one Delegent run share a conversation
     skills:
       - id: define_design_language
         name: Define the design language
@@ -104,7 +114,7 @@ agents:
         headers:
           Authorization: Bearer ${DESIGNER_KEY}
         forward_headers: [X-Delegent-Session]
-        tools: [linear__list_projects, linear__get_project, linear__list_documents,
+        tools: [ask_operator, linear__list_projects, linear__get_project, linear__list_documents,
           linear__get_document, linear__save_document, firecrawl__firecrawl_scrape]
 
   engineer:
@@ -114,6 +124,8 @@ agents:
     max_turns: 50
     timeout: 40m
     secret: ${ENGINEER_SECRET}
+    context:
+      remember: true             # tasks in one Delegent run share a conversation
     skills:
       - id: build_feature
         name: Build a feature
@@ -140,7 +152,7 @@ agents:
         headers:
           Authorization: Bearer ${ENGINEER_KEY}
         forward_headers: [X-Delegent-Session]
-        tools: [linear__get_issue, linear__get_document, linear__save_comment, github__get_me,
+        tools: [ask_operator, linear__get_issue, linear__get_document, linear__save_comment, github__get_me,
           github__search_repositories, github__create_repository, github__get_file_contents,
           github__create_branch, github__push_files, github__create_pull_request, qa__test_build,
           qa__get_task]
@@ -148,6 +160,8 @@ agents:
   qa:
     description: QA. Tests a build against its Linear story, files bugs, and passes or fails it.
     secret: ${QA_SECRET}
+    context:
+      remember: true             # tasks in one Delegent run share a conversation
     skills:
       - id: test_build
         name: Test a build
@@ -170,12 +184,14 @@ agents:
         headers:
           Authorization: Bearer ${QA_KEY}
         forward_headers: [X-Delegent-Session]
-        tools: [linear__get_issue, linear__save_issue, linear__save_comment,
+        tools: [ask_operator, linear__get_issue, linear__save_issue, linear__save_comment,
           github__pull_request_read, github__get_file_contents, firecrawl__firecrawl_scrape]
 
   devops:
     description: DevOps. Deploys a GitHub repository to Vercel and checks the site is up.
     secret: ${DEVOPS_SECRET}
+    context:
+      remember: true             # tasks in one Delegent run share a conversation
     skills:
       - id: deploy_site
         name: Deploy a site
@@ -187,9 +203,9 @@ agents:
       You are DevOps. You deploy the team's websites with Vercel.
       - Deploy only work that QA has passed. If the request does not say QA passed it, do not
         deploy; report that instead.
-      - Find your Vercel team with vercel__list_teams: use the team the request names, or else
-        the first one. Pass its id as teamId to every Vercel call that takes one. Never ask for
-        it.
+      - Find your Vercel team with vercel__list_teams. Use the team the request names; if it
+        names none and there is more than one, ask the operator which with ask_operator, listing
+        the teams as choices. Pass its id as teamId to every Vercel call that takes one.
       - Deploy the GitHub repository you are given, creating or linking the Vercel project if
         needed.
       - Wait for the deployment to finish, then fetch the site's URL to confirm it is up.
@@ -200,6 +216,6 @@ agents:
         headers:
           Authorization: Bearer ${DEVOPS_KEY}
         forward_headers: [X-Delegent-Session]
-        tools: [github__get_me, vercel__list_teams, vercel__list_projects, vercel__get_project,
+        tools: [ask_operator, github__get_me, vercel__list_teams, vercel__list_projects, vercel__get_project,
           vercel__create_git_project, vercel__create_deployment, vercel__get_deployment,
           vercel__list_deployments, firecrawl__firecrawl_scrape]

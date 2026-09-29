@@ -4,11 +4,14 @@
 //
 // Adding a CLI (codex, gemini, …) means writing a Runner that turns a Job into that CLI's
 // flags and MCP config, runs it headless, and parses its output, then registering it in
-// Register. Nothing else changes.
+// Register. Nothing else changes. A CLI that can continue a conversation reports its session
+// id in Result.SessionID and resumes it when a later Job sets Resume (claude --resume; codex
+// exec resume); one that stores sessions on disk also implements SessionForgetter.
 package runner
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"time"
@@ -24,10 +27,22 @@ type Job struct {
 	Model string
 	// MaxTurns bounds the agent's loop.
 	MaxTurns int
-	// MCP are the only servers the agent may use; it gets no other tools.
+	// MCP are the servers the agent may use.
 	MCP []MCPServer
-	// WorkDir is an empty scratch directory the CLI runs in.
+	// BuiltinTools are the CLI's own tools the agent may use, in the CLI's permission-rule
+	// syntax (for claude: "Read", "Bash(lspci *)"), or AllBuiltinTools alone for every one of
+	// them with every call allowed. Empty, the usual case, gives it none: it acts only
+	// through MCP.
+	BuiltinTools []string
+	// WorkDir is the directory the CLI runs in: an empty scratch directory, or, for a job that
+	// continues a conversation, the same directory every job of that conversation ran in.
 	WorkDir string
+	// Resume continues the CLI's earlier session with this id (a previous Result.SessionID of a
+	// job run in the same WorkDir); empty starts a new session.
+	Resume string
+	// KeepSession saves the session so a later job can resume it. Without it the CLI keeps
+	// nothing once the job ends.
+	KeepSession bool
 }
 
 // MCPServer is one Streamable HTTP MCP server, with the headers to send on every call.
@@ -50,6 +65,20 @@ type Result struct {
 	InputTokens  int
 	OutputTokens int
 	SessionID    string
+}
+
+// AllBuiltinTools, as a job's only BuiltinTools entry, gives the agent all of the CLI's
+// built-in tools with every call allowed, as if a person approved each one.
+const AllBuiltinTools = "default"
+
+// ErrSessionNotFound is returned when the session a job asked to resume no longer exists.
+// Nothing ran: the job can be run again as a new session.
+var ErrSessionNotFound = errors.New("the session to resume no longer exists")
+
+// SessionForgetter is implemented by runners whose CLI stores sessions: ForgetSessions
+// deletes every session the CLI kept for jobs run in workDir. Called when a conversation ends.
+type SessionForgetter interface {
+	ForgetSessions(workDir string) error
 }
 
 // Progress receives short, human-readable notes while a task runs ("calling linear__get_issue").

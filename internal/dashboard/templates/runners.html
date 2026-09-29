@@ -1,0 +1,36 @@
+{{define "title"}}Runners{{end}}
+
+{{define "content"}}
+<div class="page-head">
+  <div>
+    <h1>Runners</h1>
+    <p class="sub">The CLIs tasks run on. An agent's model, turn limit and timeout default to its runner's.</p>
+  </div>
+  <a class="btn primary" href="/runners/new">New runner</a>
+</div>
+<div class="table-wrap">
+<table class="table">
+  <thead><tr><th>Name</th><th>Type</th><th>Command</th><th>Model</th><th>Max turns</th><th>Timeout</th><th>Agents</th><th></th></tr></thead>
+  <tbody>
+  {{range .Runners}}
+    <tr>
+      <td><a href="/runners/{{.Name}}/edit" class="mono strong">{{.Name}}</a>
+        {{if .Implicit}}<span class="chip" title="No runners are configured, so agents run on this default">implicit</span>{{end}}</td>
+      <td>{{.Type}}</td>
+      <td><code>{{.Bin}}</code>
+        {{if .Found}}<span class="dot ok" title="Found on PATH"></span>{{else}}<span class="dot err"></span> <span class="small err-text">not on PATH: its tasks will fail</span>{{end}}</td>
+      <td>{{or .Model "–"}}</td>
+      <td>{{or .MaxTurns "–"}}</td>
+      <td>{{or .Timeout "–"}}</td>
+      <td>{{if .UsedBy}}{{join .UsedBy ", "}}{{else}}<span class="muted">none</span>{{end}}</td>
+      <td class="right nowrap">
+        <a class="btn small" href="/runners/{{.Name}}/edit">Edit</a>
+        {{if not .Implicit}}<form method="post" action="/runners/{{.Name}}/delete" class="inline" hx-push-url="false"
+              hx-confirm="Delete the runner {{.Name}}?"><button class="btn small ghost danger">Delete</button></form>{{end}}
+      </td>
+    </tr>
+  {{end}}
+  </tbody>
+</table>
+</div>
+{{end}}

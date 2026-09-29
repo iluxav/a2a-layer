@@ -64,7 +64,7 @@ func TestClaudeRunsSealedAndParsesTheStream(t *testing.T) {
 	res, err := r.Run(context.Background(), Job{
 		Prompt: "plan it", Instructions: "You are the PM.", Model: "haiku", MaxTurns: 12, WorkDir: work,
 		MCP: []MCPServer{
-			{Name: "gw", URL: "http://gw/mcp", Headers: map[string]string{"Authorization": "Bearer k", "X-Delegent-Session": "sess_1"}, Tools: []string{"linear__get_issue", "linear__save_issue"}},
+			{Name: "gw", URL: "http://gw/mcp", Headers: map[string]string{"Authorization": "Bearer k", "X-Parent-Session": "sess_1"}, Tools: []string{"linear__get_issue", "linear__save_issue"}},
 			{Name: "docs", URL: "http://docs/mcp"},
 		},
 	}, func(n string) { notes = append(notes, n) })
@@ -112,7 +112,7 @@ func TestClaudeRunsSealedAndParsesTheStream(t *testing.T) {
 		t.Fatalf("mcp config %s: %v", cfgPath, err)
 	}
 	gw := cfg.MCPServers["gw"]
-	if gw.Type != "http" || gw.URL != "http://gw/mcp" || gw.Headers["X-Delegent-Session"] != "sess_1" || gw.Headers["Authorization"] != "Bearer k" {
+	if gw.Type != "http" || gw.URL != "http://gw/mcp" || gw.Headers["X-Parent-Session"] != "sess_1" || gw.Headers["Authorization"] != "Bearer k" {
 		t.Errorf("gw config = %+v", gw)
 	}
 	raw, _ := os.ReadFile(cfgPath)
@@ -121,6 +121,49 @@ func TestClaudeRunsSealedAndParsesTheStream(t *testing.T) {
 	}
 	if filepath.Dir(cfgPath) != work {
 		t.Errorf("the MCP config belongs in the job's work dir, got %s", cfgPath)
+	}
+}
+
+func TestClaudeGetsOnlyTheBuiltinToolsAJobLists(t *testing.T) {
+	bin, dir := fakeClaude(t, 0,
+		`{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash","input":{"command":"lspci -k","description":"list devices"}}]}}`,
+		`{"type":"assistant","message":{"content":[{"type":"tool_use","name":"mcp__gw__search","input":{"url":"https://secret.example"}}]}}`,
+		`{"type":"result","subtype":"success","result":"An RTX 4090.","num_turns":2}`,
+	)
+	var notes []string
+	r := NewClaude(Options{Command: bin})
+	_, err := r.Run(context.Background(), Job{Prompt: "what is my gpu", WorkDir: t.TempDir(),
+		BuiltinTools: []string{"Bash(lspci *)", "Read", "Bash(nvidia-smi)"},
+		MCP:          []MCPServer{{Name: "gw", URL: "http://gw/mcp", Tools: []string{"search"}}},
+	}, func(n string) { notes = append(notes, n) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	args := recordedArgs(t, dir)
+	if got, _ := flagValue(args, "--tools"); got != "Bash,Read" {
+		t.Errorf("--tools = %q, want Bash,Read", got)
+	}
+	if got, _ := flagValue(args, "--allowedTools"); got != "mcp__gw__search,Bash(lspci *),Read,Bash(nvidia-smi)" {
+		t.Errorf("--allowedTools = %q", got)
+	}
+	if strings.Join(notes, " | ") != "calling Bash: lspci -k | calling search" {
+		t.Errorf("progress = %q", notes)
+	}
+}
+
+func TestClaudeDefaultGivesEveryBuiltinTool(t *testing.T) {
+	bin, dir := fakeClaude(t, 0, `{"type":"result","subtype":"success","result":"ok","num_turns":1}`)
+	r := NewClaude(Options{Command: bin})
+	_, err := r.Run(context.Background(), Job{Prompt: "hi", WorkDir: t.TempDir(), BuiltinTools: []string{AllBuiltinTools},
+		MCP: []MCPServer{{Name: "gw", URL: "http://gw/mcp", Tools: []string{"search"}}}}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	args := recordedArgs(t, dir)
+	for flag, want := range map[string]string{"--tools": "default", "--permission-mode": "bypassPermissions", "--allowedTools": "mcp__gw__search"} {
+		if got, _ := flagValue(args, flag); got != want {
+			t.Errorf("%s = %q, want %q", flag, got, want)
+		}
 	}
 }
 
@@ -172,4 +215,62 @@ func contains(xs []string, x string) bool {
 		}
 	}
 	return false
+}
+
+// A job that keeps its session saves it and resumes the one it names; one that does not
+// keeps nothing.
+func TestClaudeKeepsAndResumesSessions(t *testing.T) {
+	ok := `{"type":"result","subtype":"success","is_error":false,"result":"hi","num_turns":1,"session_id":"s9"}`
+	bin, dir := fakeClaude(t, 0, ok)
+	c := NewClaude(Options{Command: bin})
+	res, err := c.Run(context.Background(), Job{Prompt: "x", WorkDir: t.TempDir(), KeepSession: true, Resume: "s9"}, nil)
+	if err != nil || res.SessionID != "s9" {
+		t.Fatalf("%+v %v", res, err)
+	}
+	args := recordedArgs(t, dir)
+	if v, _ := flagValue(args, "--resume"); v != "s9" {
+		t.Errorf("--resume = %q in %v", v, args)
+	}
+	for _, a := range args {
+		if a == "--no-session-persistence" {
+			t.Error("a kept session was not saved")
+		}
+	}
+	bin, dir = fakeClaude(t, 0, ok)
+	if _, err := NewClaude(Options{Command: bin}).Run(context.Background(), Job{Prompt: "x", WorkDir: t.TempDir()}, nil); err != nil {
+		t.Fatal(err)
+	}
+	args = recordedArgs(t, dir)
+	if _, has := flagValue(args, "--resume"); has || !strings.Contains(strings.Join(args, " "), "--no-session-persistence") {
+		t.Errorf("a stateless job: %v", args)
+	}
+}
+
+func TestClaudeReportsAMissingSession(t *testing.T) {
+	bin, _ := fakeClaude(t, 1, `{"type":"result","subtype":"error_during_execution","is_error":true,"num_turns":0,"session_id":"gone","errors":["No conversation found with session ID: gone"]}`)
+	_, err := NewClaude(Options{Command: bin}).Run(context.Background(), Job{Prompt: "x", WorkDir: t.TempDir(), KeepSession: true, Resume: "gone"}, nil)
+	if err != ErrSessionNotFound {
+		t.Errorf("err = %v", err)
+	}
+}
+
+func TestClaudeForgetsAWorkDirsSessions(t *testing.T) {
+	config := t.TempDir()
+	work := filepath.Join(t.TempDir(), "a2a-pm-ctx-123")
+	os.MkdirAll(work, 0o700)
+	project := filepath.Join(config, "projects", projectDirName(work))
+	os.MkdirAll(project, 0o700)
+	os.WriteFile(filepath.Join(project, "s1.jsonl"), []byte("{}"), 0o600)
+	keep := filepath.Join(config, "projects", "-home-someone-else")
+	os.MkdirAll(keep, 0o700)
+	c := NewClaude(Options{Env: map[string]string{"CLAUDE_CONFIG_DIR": config}}).(*Claude)
+	if err := c.ForgetSessions(work); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(project); !os.IsNotExist(err) {
+		t.Error("the work dir's sessions are still there")
+	}
+	if _, err := os.Stat(keep); err != nil {
+		t.Error("another directory's sessions were deleted")
+	}
 }

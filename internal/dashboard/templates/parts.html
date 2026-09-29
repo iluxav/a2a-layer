@@ -1,0 +1,80 @@
+{{/* Pieces htmx swaps into pages on their own, also used by the pages. */}}
+
+{{define "mcp-row"}}
+<div class="row">
+  <input type="hidden" name="mcp" value="{{.Row}}">
+  <input type="hidden" name="mcp_{{.Row}}_orig" value="{{.Original}}">
+  <div class="grid">
+    <label>Name <input name="mcp_{{.Row}}_name" value="{{.Name}}" placeholder="gateway" required></label>
+    <label class="span2">URL <input name="mcp_{{.Row}}_url" value="{{.URL}}" placeholder="https://mcp.example.com/mcp or ${GATEWAY_URL}" required>
+      <small>A Streamable HTTP MCP server.</small></label>
+    <label class="span2">Headers <textarea name="mcp_{{.Row}}_headers" rows="2" class="mono" placeholder="Authorization: Bearer ${GATEWAY_KEY}">{{.Headers}}</textarea>
+      <small>One <code>Name: value</code> per line, sent on every call. The CLI never sees them.</small></label>
+    <label>Forward headers <input name="mcp_{{.Row}}_forward" value="{{.ForwardHeaders}}" placeholder="X-Session-Id">
+      <small>Copied from the A2A request onto every call.</small></label>
+    <label class="wide">Allowed tools <textarea name="mcp_{{.Row}}_tools" rows="3" class="mono" placeholder="Empty allows every tool the server offers">{{.Tools}}</textarea>
+      <small>One per line, or comma-separated. The agent sees only these.</small></label>
+  </div>
+  <button type="button" class="btn ghost danger small remove-row">Remove server</button>
+</div>
+{{end}}
+
+{{define "skill-row"}}
+<div class="row">
+  <input type="hidden" name="skill" value="{{.Row}}">
+  <div class="grid">
+    <label>ID <input name="skill_{{.Row}}_id" value="{{.ID}}" placeholder="plan_project" required></label>
+    <label>Name <input name="skill_{{.Row}}_name" value="{{.Name}}" placeholder="Plan a project"></label>
+    <label>Tags <input name="skill_{{.Row}}_tags" value="{{.Tags}}" placeholder="planning, write"></label>
+    <label class="wide">Description <textarea name="skill_{{.Row}}_description" rows="2" required>{{.Description}}</textarea></label>
+    <label class="wide">Examples <textarea name="skill_{{.Row}}_examples" rows="2" placeholder="One example request per line">{{.Examples}}</textarea>
+      <small>The playground offers them as ready-made messages.</small></label>
+  </div>
+  <button type="button" class="btn ghost danger small remove-row">Remove skill</button>
+</div>
+{{end}}
+
+{{define "agent-info"}}{{with .}}
+<div class="agent-info">
+  <p>{{.Description}}</p>
+  <dl class="facts">
+    <dt>Runs on</dt><dd>{{.Runner}}{{with .Model}} · {{.}}{{end}} · up to {{.MaxTurns}} turns in {{.Timeout}}</dd>
+    <dt>Tools</dt><dd>{{range .MCP}}<div><strong>{{.Name}}</strong>: {{if .Tools}}<span class="mono small">{{join .Tools ", "}}</span>{{else}}every tool it offers{{end}}</div>{{end}}
+      {{- with .Builtin}}<div><strong>built-in</strong>: {{if eq (join . ",") "default"}}every tool, every call allowed{{else}}<span class="mono small">{{join . ", "}}</span>{{end}}</div>{{end}}
+      {{- if and (not .MCP) (not .Builtin)}}<span class="err-text">none</span>: it can only answer from what it knows, and cannot run or read anything.
+        <a href="/agents/{{.Name}}/edit">Give it tools</a>{{end}}</dd>
+    <dt>Memory</dt><dd>{{if .Remember}}remembers earlier tasks of a conversation{{else}}every task starts from nothing{{end}}</dd>
+  </dl>
+  {{with .Examples}}<div class="examples">{{range .}}<button type="button" class="chip example" data-example="{{.}}" title="Use this message">{{.}}</button>{{end}}</div>{{end}}
+</div>
+{{end}}{{end}}
+
+{{define "run"}}
+<article class="run" id="run-{{.ID}}"{{if not .Done}} hx-get="/playground/runs/{{.ID}}" hx-trigger="every 1s" hx-swap="outerHTML"{{end}}>
+  <header>
+    <span class="badge {{.State}}">{{.State}}</span>
+    <strong class="mono">{{.Agent}}</strong>
+    <span class="muted small">{{.Elapsed}}</span>
+    <span class="grow"></span>
+    {{if not .Done}}<button type="button" class="btn small ghost danger" hx-post="/playground/runs/{{.ID}}/cancel" hx-target="#run-{{.ID}}" hx-swap="outerHTML">Cancel</button>{{end}}
+  </header>
+  {{with .Note}}<p class="note">{{.}}</p>{{end}}
+  <div class="prompt">{{.Prompt}}</div>
+  {{if .Notes}}<ol class="log">{{range .Notes}}<li>{{.}}</li>{{end}}</ol>{{end}}
+  {{with .Failure}}<div class="failure">{{.}}</div>{{end}}
+  {{with .Answer}}<div class="answer">{{.}}</div>{{end}}
+  <footer>
+    {{range .Meta}}<span class="meta"><span>{{.Label}}</span> {{.Value}}</span>{{end}}
+    <span class="grow"></span>
+    {{if .Stale}}<span class="muted small" title="The config file changed after this run started">earlier config</span>{{end}}
+    {{if and .Remember .Done}}<button type="button" class="btn small continue" data-agent="{{.Agent}}" data-context="{{.ContextID}}" title="Send the next message in this conversation">Continue conversation</button>{{end}}
+  </footer>
+</article>
+{{end}}
+
+{{define "run-error"}}
+<article class="run">
+  <header><span class="badge failed">not sent</span></header>
+  <div class="failure">{{.}}</div>
+</article>
+{{end}}

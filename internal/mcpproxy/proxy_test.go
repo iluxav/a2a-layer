@@ -21,7 +21,7 @@ func fakeUpstream(t *testing.T) *httptest.Server {
 			func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 				h := req.Extra.Header
 				elicit := req.Session.InitializeParams().Capabilities.Elicitation != nil
-				text := name + " auth=" + h.Get("Authorization") + " session=" + h.Get("X-Delegent-Session")
+				text := name + " auth=" + h.Get("Authorization") + " session=" + h.Get("X-Parent-Session")
 				if elicit {
 					text += " elicitation-offered"
 				}
@@ -52,8 +52,8 @@ func TestProxyServesOnlyTheAllowedTools(t *testing.T) {
 	p = New(front.URL)
 
 	served, closeProxy, err := p.Open(context.Background(), []Upstream{{
-		Name: "delegent", URL: up.URL,
-		Headers: map[string]string{"Authorization": "Bearer dgk_pm", "X-Delegent-Session": "sess_1"},
+		Name: "gateway", URL: up.URL,
+		Headers: map[string]string{"Authorization": "Bearer dgk_pm", "X-Parent-Session": "sess_1"},
 		Tools:   []string{"linear__get_issue", "linear__save_issue", "linear__gone"},
 	}})
 	if err != nil {

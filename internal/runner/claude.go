@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 )
@@ -17,9 +18,10 @@ import (
 func init() { Register("claude", NewClaude) }
 
 // Claude runs tasks on Claude Code in headless mode (claude -p), under whatever login the
-// CLI already has. Each run is sealed off: no built-in tools (no shell, files or web), no
-// settings files, hooks or plugins, no saved session, and only the job's MCP servers, so
-// everything the agent does goes through those servers.
+// CLI already has. Each run is sealed off: no built-in tools (no shell, files or web) unless
+// the job lists them, no settings files, hooks or plugins, no saved session, and only the
+// job's MCP servers, so everything else the agent does goes through those servers. A job that keeps its session saves it
+// where claude keeps sessions for the job's work dir, and a later job resumes it there.
 type Claude struct {
 	opts Options
 }
@@ -71,6 +73,9 @@ func (c *Claude) Run(ctx context.Context, job Job, progress Progress) (Result, e
 		return Result{}, ctx.Err()
 	}
 	if gotResult {
+		if job.Resume != "" && res.IsError && res.Turns == 0 && strings.Contains(res.Text, "No conversation found") {
+			return Result{}, ErrSessionNotFound
+		}
 		return res, nil
 	}
 	msg := strings.TrimSpace(stderr.String())
@@ -108,14 +113,38 @@ func (c *Claude) args(job Job) ([]string, error) {
 	if err := os.WriteFile(cfgPath, cfg, 0o600); err != nil {
 		return nil, err
 	}
+	// Built-in tools only as the job lists them (none by default: the agent acts only through
+	// its MCP servers). A rule such as Bash(lspci *) makes the tool available and allows only
+	// the calls it matches; anything not allowed is refused, never asked (dontAsk).
+	tools, permissions := "", "dontAsk"
+	if slices.Equal(job.BuiltinTools, []string{AllBuiltinTools}) {
+		// Every built-in tool, every call allowed. MCP stays limited all the same: the servers
+		// the CLI is given (the task's proxy) offer only the allowed tools.
+		tools, permissions = "default", "bypassPermissions"
+	} else {
+		var builtin []string
+		for _, rule := range job.BuiltinTools {
+			name, _, _ := strings.Cut(rule, "(")
+			if name = strings.TrimSpace(name); name != "" && !slices.Contains(builtin, name) {
+				builtin = append(builtin, name)
+			}
+			allowed = append(allowed, rule)
+		}
+		tools = strings.Join(builtin, ",")
+	}
 	args := []string{
 		"-p",
 		"--output-format", "stream-json", "--verbose",
-		"--tools", "", // no built-in tools: the agent acts only through its MCP servers
+		"--tools", tools,
 		"--mcp-config", cfgPath, "--strict-mcp-config",
 		"--setting-sources", "", // ignore user, project and local settings (hooks, plugins)
-		"--no-session-persistence",
-		"--permission-mode", "dontAsk", // anything not allowed below is refused, never asked
+		"--permission-mode", permissions,
+	}
+	if !job.KeepSession {
+		args = append(args, "--no-session-persistence")
+	}
+	if job.Resume != "" {
+		args = append(args, "--resume", job.Resume)
 	}
 	if job.Model != "" {
 		args = append(args, "--model", job.Model)
@@ -140,16 +169,18 @@ type streamEvent struct {
 	Subtype string `json:"subtype"`
 	Message struct {
 		Content []struct {
-			Type string `json:"type"`
-			Text string `json:"text"`
-			Name string `json:"name"`
+			Type  string    `json:"type"`
+			Text  string    `json:"text"`
+			Name  string    `json:"name"`
+			Input toolInput `json:"input"`
 		} `json:"content"`
 	} `json:"message"`
-	Result       string  `json:"result"`
-	IsError      bool    `json:"is_error"`
-	NumTurns     int     `json:"num_turns"`
-	TotalCostUSD float64 `json:"total_cost_usd"`
-	SessionID    string  `json:"session_id"`
+	Result       string   `json:"result"`
+	IsError      bool     `json:"is_error"`
+	NumTurns     int      `json:"num_turns"`
+	TotalCostUSD float64  `json:"total_cost_usd"`
+	SessionID    string   `json:"session_id"`
+	Errors       []string `json:"errors"`
 	Usage        struct {
 		InputTokens              int `json:"input_tokens"`
 		CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
@@ -174,7 +205,13 @@ func (c *Claude) read(r io.Reader, job Job, progress Progress) (Result, bool) {
 			for _, part := range ev.Message.Content {
 				switch part.Type {
 				case "tool_use":
-					progress("calling " + displayTool(part.Name, job.MCP))
+					note := "calling " + displayTool(part.Name, job.MCP)
+					// A built-in tool's command or file says what it is doing; an MCP call's
+					// arguments stay out of the task's status.
+					if d := part.Input.detail(); d != "" && !strings.HasPrefix(part.Name, "mcp__") {
+						note += ": " + d
+					}
+					progress(note)
 				case "text":
 					if t := strings.TrimSpace(part.Text); t != "" {
 						progress(t)
@@ -192,12 +229,77 @@ func (c *Claude) read(r io.Reader, job Job, progress Progress) (Result, bool) {
 				OutputTokens: ev.Usage.OutputTokens,
 				SessionID:    ev.SessionID,
 			}
+			if res.IsError && res.Text == "" && len(ev.Errors) > 0 {
+				res.Text = strings.Join(ev.Errors, "; ")
+			}
 			if res.IsError && res.Text == "" {
 				res.Text = describeFailure(ev.Subtype, job.MaxTurns)
 			}
 		}
 	}
 	return res, got
+}
+
+// ForgetSessions implements SessionForgetter: claude keeps the sessions of a directory in
+// <config dir>/projects/<the directory's path, every other character a dash>. Only that
+// directory is removed, and only a work dir's own (the server gives each conversation its own).
+func (c *Claude) ForgetSessions(workDir string) error {
+	configDir := c.opts.Env["CLAUDE_CONFIG_DIR"]
+	if configDir == "" {
+		configDir = os.Getenv("CLAUDE_CONFIG_DIR")
+	}
+	if configDir == "" {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return err
+		}
+		configDir = filepath.Join(home, ".claude")
+	}
+	dirs := []string{workDir}
+	if abs, err := filepath.Abs(workDir); err == nil {
+		dirs = append(dirs, abs)
+		if real, err := filepath.EvalSymlinks(abs); err == nil {
+			dirs = append(dirs, real)
+		}
+	}
+	for _, d := range dirs {
+		if d == "" || d == "/" {
+			continue
+		}
+		p := filepath.Join(configDir, "projects", projectDirName(d))
+		if err := os.RemoveAll(p); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// projectDirName is claude's name for a directory's session folder.
+func projectDirName(dir string) string {
+	b := []byte(dir)
+	for i, ch := range b {
+		if !(ch >= 'a' && ch <= 'z' || ch >= 'A' && ch <= 'Z' || ch >= '0' && ch <= '9') {
+			b[i] = '-'
+		}
+	}
+	return string(b)
+}
+
+// toolInput is what a built-in tool call names: its command, file, pattern or URL.
+type toolInput struct {
+	Command  string `json:"command"`
+	FilePath string `json:"file_path"`
+	Pattern  string `json:"pattern"`
+	URL      string `json:"url"`
+}
+
+func (in toolInput) detail() string {
+	for _, s := range []string{in.Command, in.FilePath, in.Pattern, in.URL} {
+		if s != "" {
+			return s
+		}
+	}
+	return ""
 }
 
 // displayTool turns claude's mcp__<server>__<tool> back into the tool's own name.

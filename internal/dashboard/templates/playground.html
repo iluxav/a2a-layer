@@ -1,0 +1,48 @@
+{{define "title"}}Playground{{end}}
+
+{{define "content"}}
+<div class="page-head">
+  <div>
+    <h1>Playground</h1>
+    <p class="sub">Send an agent a message and follow its task. The agents run here, as the config file defines them now: a2a-layer need not be running.</p>
+  </div>
+</div>
+{{with .Play}}
+{{if .Unready}}
+<div class="empty">
+  <p>Nothing to run yet: {{.Unready}}.</p>
+  <a class="btn primary" href="/agents/new">New agent</a>
+</div>
+{{else}}
+<div class="play">
+  <form class="panel" id="play-form" hx-post="/playground/runs" hx-target="#runs" hx-swap="afterbegin"
+        hx-push-url="false" hx-disabled-elt="find .btn.primary">
+    <label>Agent
+      <select name="agent" id="play-agent" hx-get="/playground/agent" hx-target="#agent-info" hx-trigger="change">
+        {{range .Agents}}<option value="{{.Name}}"{{if eq .Name $.Play.Agent}} selected{{end}}>{{.Name}}</option>{{end}}
+      </select>
+    </label>
+    <div id="agent-info">{{template "agent-info" .Selected}}</div>
+    <label>Message
+      <textarea name="message" id="play-message" rows="6" required placeholder="What should the agent do?"></textarea></label>
+    <label>Conversation
+      <input name="context" id="play-context" class="mono" placeholder="a new one" autocomplete="off" spellcheck="false">
+      <small>An A2A context id. Empty starts a new conversation; an agent that remembers continues the one named.</small></label>
+    <details>
+      <summary>Request headers</summary>
+      <label><textarea name="headers" rows="2" class="mono" placeholder="X-Session-Id: abc123"></textarea>
+        <small>Sent with the A2A request. The agent passes on those its MCP servers list in forward headers.</small></label>
+    </details>
+    <div class="actions">
+      <button class="btn primary">Send</button>
+      <span class="muted small"><kbd>Ctrl</kbd> + <kbd>Enter</kbd></span>
+    </div>
+  </form>
+  <section id="runs" class="runs">
+    {{range .Runs}}{{template "run" .}}{{end}}
+    <p class="empty-runs muted">Runs show up here, newest first.</p>
+  </section>
+</div>
+{{end}}
+{{end}}
+{{end}}

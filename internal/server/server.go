@@ -34,6 +34,7 @@ type Server struct {
 	cfg    *config.Config
 	agents map[string]*agent
 	tasks  *store
+	convs  *conversations  // what each remembering agent keeps per A2A context
 	proxy  *mcpproxy.Proxy // each task's filtered MCP servers, on this listener
 	log    *slog.Logger
 	ctx    context.Context // canceled on shutdown, which cancels every running task
@@ -49,13 +50,29 @@ type agent struct {
 	prompt string        // instructions + common instructions
 }
 
+// Option adjusts a Server as New builds it.
+type Option func(*Server)
+
+// WithProxy has the server's tasks reach their MCP servers through p instead of a proxy of its
+// own on cfg.Listen. The caller serves p (under mcpproxy.PathPrefix) at the base URL it was made
+// with; servers that share a listener share its proxy, as the dashboard's playground does.
+func WithProxy(p *mcpproxy.Proxy) Option {
+	return func(s *Server) { s.proxy = p }
+}
+
 // New builds the server. runners maps each configured runner name to its implementation.
-func New(cfg *config.Config, runners map[string]runner.Runner, log *slog.Logger) (*Server, error) {
+func New(cfg *config.Config, runners map[string]runner.Runner, log *slog.Logger, opts ...Option) (*Server, error) {
 	if log == nil {
 		log = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
 	ctx, stop := context.WithCancel(context.Background())
-	s := &Server{cfg: cfg, agents: map[string]*agent{}, tasks: newStore(), proxy: mcpproxy.New(loopbackURL(cfg.Listen)), log: log, ctx: ctx, stop: stop}
+	s := &Server{cfg: cfg, agents: map[string]*agent{}, tasks: newStore(), convs: newConversations(), log: log, ctx: ctx, stop: stop}
+	for _, o := range opts {
+		o(s)
+	}
+	if s.proxy == nil {
+		s.proxy = mcpproxy.New(LoopbackURL(cfg.Listen))
+	}
 	for _, name := range cfg.AgentNames() {
 		a := cfg.Agents[name]
 		r, ok := runners[a.Runner]
@@ -73,11 +90,40 @@ func New(cfg *config.Config, runners map[string]runner.Runner, log *slog.Logger)
 	return s, nil
 }
 
-// Shutdown cancels every running task.
-func (s *Server) Shutdown() { s.stop() }
+// Shutdown cancels every running task and ends every conversation (its sessions and
+// directories are deleted: the conversations live in memory, so nothing could resume them).
+func (s *Server) Shutdown() {
+	s.stop()
+	deadline := time.Now().Add(10 * time.Second)
+	for s.convs.count() > 0 && time.Now().Before(deadline) {
+		s.endConversations(s.convs.sweep(time.Now(), true))
+		if s.convs.count() > 0 {
+			time.Sleep(100 * time.Millisecond) // a canceled task is still leaving its conversation
+		}
+	}
+}
+
+// endConversations deletes what ended conversations kept: the CLI's sessions and the
+// directory their tasks ran in.
+func (s *Server) endConversations(ended []*conversation) {
+	for _, c := range ended {
+		if c.dir == "" {
+			continue
+		}
+		if a := s.agents[c.agent]; a != nil {
+			if f, ok := a.runner.(runner.SessionForgetter); ok {
+				if err := f.ForgetSessions(c.dir); err != nil {
+					s.log.Warn("could not delete a conversation's sessions", "agent", c.agent, "err", err)
+				}
+			}
+		}
+		os.RemoveAll(c.dir)
+		s.log.Info("conversation ended", "agent", c.agent, "context", c.contextID)
+	}
+}
 
 func (s *Server) sweepLoop() {
-	t := time.NewTicker(5 * time.Minute)
+	t := time.NewTicker(time.Minute)
 	defer t.Stop()
 	for {
 		select {
@@ -85,6 +131,7 @@ func (s *Server) sweepLoop() {
 			return
 		case now := <-t.C:
 			s.tasks.sweep(now)
+			s.endConversations(s.convs.sweep(now, false))
 		}
 	}
 }
@@ -110,9 +157,22 @@ func cardFor(publicURL string, a *config.Agent) a2a.AgentCard {
 	return c
 }
 
-// loopbackURL is where a CLI on this machine reaches the listener: a wildcard bind address
+// NewRunners builds the implementation of each runner in the config, by name.
+func NewRunners(cfg *config.Config) (map[string]runner.Runner, error) {
+	runners := map[string]runner.Runner{}
+	for name, rc := range cfg.Runners {
+		r, err := runner.New(rc.Type, runner.Options{Command: rc.Command, Args: rc.Args, Env: rc.Env})
+		if err != nil {
+			return nil, fmt.Errorf("runner %s: %w", name, err)
+		}
+		runners[name] = r
+	}
+	return runners, nil
+}
+
+// LoopbackURL is where a CLI on this machine reaches a listener: a wildcard bind address
 // (0.0.0.0, ::, or none) is reached through 127.0.0.1.
-func loopbackURL(listen string) string {
+func LoopbackURL(listen string) string {
 	host, port, err := net.SplitHostPort(listen)
 	if err != nil {
 		return "http://" + listen
@@ -278,7 +338,7 @@ func (s *Server) start(a *agent, msg a2a.Message, prompt string, inbound http.He
 		t.request.Kind = "message"
 	}
 	s.tasks.add(t)
-	job := runner.Job{Prompt: prompt, Instructions: a.prompt, Model: a.cfg.Model, MaxTurns: a.cfg.MaxTurns}
+	job := runner.Job{Prompt: prompt, Instructions: a.prompt, Model: a.cfg.Model, MaxTurns: a.cfg.MaxTurns, BuiltinTools: a.cfg.BuiltinTools}
 	go s.run(ctx, a, t, job, upstreamsFor(a.cfg, inbound))
 	return t
 }
@@ -306,6 +366,17 @@ func upstreamsFor(a *config.Agent, inbound http.Header) []mcpproxy.Upstream {
 // run waits for a free slot, opens the task's MCP proxy, runs the job, and records the outcome.
 func (s *Server) run(ctx context.Context, a *agent, t *task, job runner.Job, upstreams []mcpproxy.Upstream) {
 	defer t.cancel()
+	// A remembering agent runs a context's tasks one at a time, in the context's own session.
+	var conv *conversation
+	if a.cfg.Context.Remember {
+		c, err := s.convs.acquire(ctx, a.cfg.Name, t.contextID, time.Duration(a.cfg.Context.IdleTimeout))
+		if err != nil {
+			t.setState(a2a.StateFailed, "never started: "+reason(ctx))
+			return
+		}
+		defer s.convs.release(c)
+		conv = c
+	}
 	select {
 	case a.slots <- struct{}{}:
 		defer func() { <-a.slots }()
@@ -316,13 +387,31 @@ func (s *Server) run(ctx context.Context, a *agent, t *task, job runner.Job, ups
 	if !t.setState(a2a.StateWorking, "started") {
 		return // canceled while waiting for a slot
 	}
-	dir, err := os.MkdirTemp(s.cfg.WorkDir, "a2a-"+a.cfg.Name+"-")
-	if err != nil {
-		t.setState(a2a.StateFailed, "could not create a work directory: "+err.Error())
-		return
+	if conv != nil {
+		if conv.dir == "" {
+			dir, err := os.MkdirTemp(s.cfg.WorkDir, "a2a-"+a.cfg.Name+"-ctx-")
+			if err != nil {
+				t.setState(a2a.StateFailed, "could not create a work directory: "+err.Error())
+				return
+			}
+			conv.dir = dir // kept for the conversation's next task; deleted when it ends
+		}
+		if conv.session != "" && conv.tasks >= a.cfg.Context.MaxTasks {
+			// The session carries every earlier task; past the cap it starts afresh.
+			s.log.Info("conversation session restarted", "agent", a.cfg.Name, "context", t.contextID, "after_tasks", conv.tasks)
+			t.note("this conversation reached its limit of " + fmt.Sprint(a.cfg.Context.MaxTasks) + " tasks: starting a fresh session without the earlier ones")
+			conv.session, conv.tasks = "", 0
+		}
+		job.WorkDir, job.Resume, job.KeepSession = conv.dir, conv.session, true
+	} else {
+		dir, err := os.MkdirTemp(s.cfg.WorkDir, "a2a-"+a.cfg.Name+"-")
+		if err != nil {
+			t.setState(a2a.StateFailed, "could not create a work directory: "+err.Error())
+			return
+		}
+		defer os.RemoveAll(dir)
+		job.WorkDir = dir
 	}
-	defer os.RemoveAll(dir)
-	job.WorkDir = dir
 
 	// The CLI gets the agent's MCP servers through the proxy: only the allowed tools, and the
 	// configured and forwarded headers applied upstream, never shown to the CLI.
@@ -352,8 +441,19 @@ func (s *Server) run(ctx context.Context, a *agent, t *task, job runner.Job, ups
 
 	started := time.Now()
 	s.log.Info("task started", "agent", a.cfg.Name, "task", t.id, "model", job.Model)
-	res, err := a.runner.Run(ctx, job, func(note string) { t.note(truncate(note, 400)) })
+	progress := func(note string) { t.note(truncate(note, 400)) }
+	res, err := a.runner.Run(ctx, job, progress)
+	if errors.Is(err, runner.ErrSessionNotFound) {
+		// The session is gone (deleted outside the server): nothing ran, so start a new one.
+		s.log.Warn("conversation session missing; starting a new one", "agent", a.cfg.Name, "context", t.contextID)
+		job.Resume = ""
+		res, err = a.runner.Run(ctx, job, progress)
+	}
 	elapsed := time.Since(started).Round(time.Second)
+	if conv != nil && err == nil && res.SessionID != "" {
+		conv.session = res.SessionID
+		conv.tasks++
+	}
 
 	t.mu.Lock()
 	t.metadata["duration_seconds"] = int(elapsed.Seconds())
@@ -362,6 +462,10 @@ func (s *Server) run(ctx context.Context, a *agent, t *task, job runner.Job, ups
 		t.metadata["cost_usd"] = res.CostUSD
 		t.metadata["input_tokens"] = res.InputTokens
 		t.metadata["output_tokens"] = res.OutputTokens
+		if conv != nil {
+			t.metadata["context_task"] = conv.tasks // this task's place in the conversation's session
+			t.metadata["resumed"] = job.Resume != ""
+		}
 		if res.Text != "" {
 			t.artifacts = []a2a.Artifact{{ArtifactID: newID(), Parts: []a2a.Part{a2a.TextPart(res.Text)}}}
 		}

@@ -1,0 +1,33 @@
+{{define "title"}}Settings{{end}}
+
+{{define "content"}}
+<div class="page-head">
+  <div>
+    <h1>Settings</h1>
+    <p class="sub">How a2a-layer serves the agents. It reads them when it starts.</p>
+  </div>
+</div>
+{{with .Settings}}
+<form method="post" action="/settings" class="form" hx-push-url="false">
+  <fieldset>
+    <legend>Server</legend>
+    <div class="grid">
+      <label>Listen <input name="listen" value="{{.Listen}}" placeholder="127.0.0.1:7300">
+        <small>The address the agents are served on.</small></label>
+      <label>Public URL <input name="public_url" value="{{.PublicURL}}" placeholder="http://&lt;listen&gt;">
+        <small>The base URL in the agents' cards.</small></label>
+      <label>Env file <input name="env_file" value="{{.EnvFile}}" placeholder=".env">
+        <small>Loaded before <code>${NAME}</code> expansion, relative to the config file.</small></label>
+      <label>Work dir <input name="work_dir" value="{{.WorkDir}}" placeholder="the system temp dir">
+        <small>Where each task's scratch directory goes.</small></label>
+    </div>
+  </fieldset>
+  <fieldset>
+    <legend>Common instructions</legend>
+    <label class="wide"><textarea name="common_instructions" rows="14" class="mono" placeholder="How every agent works…">{{.CommonInstructions}}</textarea>
+      <small>Appended to every agent's instructions.</small></label>
+  </fieldset>
+  <div class="actions"><button class="btn primary">Save settings</button></div>
+</form>
+{{end}}
+{{end}}

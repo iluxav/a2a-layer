@@ -84,7 +84,7 @@ func fakeGateway(t *testing.T) string {
 		server.AddTool(&mcp.Tool{Name: name, InputSchema: map[string]any{"type": "object"}},
 			func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 				h := req.Extra.Header
-				return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: name + " auth=" + h.Get("Authorization") + " session=" + h.Get("X-Delegent-Session")}}}, nil
+				return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: name + " auth=" + h.Get("Authorization") + " session=" + h.Get("X-Parent-Session")}}}, nil
 			})
 	}
 	ts := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return server }, nil))
@@ -123,7 +123,7 @@ func newTestServerWith(t *testing.T, f *fakeRunner, maxParallel int, gatewayURL 
 				Skills: []config.Skill{{ID: "plan_project", Name: "Plan", Description: "Plans a project."}},
 				MCP: map[string]config.MCPServer{"gw": {
 					URL: gatewayURL, Headers: map[string]string{"Authorization": "Bearer dgk_pm"},
-					ForwardHeaders: []string{"X-Delegent-Session"}, Tools: []string{"linear__get_issue", "linear__gone"},
+					ForwardHeaders: []string{"X-Parent-Session"}, Tools: []string{"linear__get_issue", "linear__gone"},
 				}},
 			},
 			"open": {Name: "open", Description: "No secret.", Version: "1.0.0", Runner: "claude", MaxTurns: 3, Timeout: config.Duration(time.Minute), MaxParallel: 1,
@@ -250,7 +250,7 @@ func TestNonBlockingSendIsPolledToCompletion(t *testing.T) {
 	f := &fakeRunner{release: make(chan struct{})}
 	ts := newTestServer(t, f, 1)
 	no := false
-	h := http.Header{"X-Delegent-Session": {"sess_parent"}, "X-Other": {"not forwarded"}}
+	h := http.Header{"X-Parent-Session": {"sess_parent"}, "X-Other": {"not forwarded"}}
 	task := asTask(t, call(t, ts.URL+"/pm", "s3cret", "message/send", sendParams("plan Brewline", &no), h))
 	if a2a.Terminal(task.Status.State) || task.ID == "" || task.ContextID == "" {
 		t.Fatalf("a non-blocking send answers at once with a live task: %+v", task)

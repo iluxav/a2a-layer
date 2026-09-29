@@ -3,6 +3,7 @@
 // endpoint at /<name>.
 //
 //	a2a-layer -config agents.yaml
+//	a2a-layer dashboard -config agents.yaml   # a web UI to edit the config and try the agents
 package main
 
 import (
@@ -20,13 +21,25 @@ import (
 	"time"
 
 	"github.com/iluxav/a2a-layer/internal/config"
-	"github.com/iluxav/a2a-layer/internal/runner"
 	"github.com/iluxav/a2a-layer/internal/server"
 )
 
 var version = "dev"
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "dashboard" {
+		log := slog.New(slog.NewTextHandler(os.Stderr, nil))
+		if err := runDashboard(os.Args[2:], log); err != nil {
+			log.Error(err.Error())
+			os.Exit(1)
+		}
+		return
+	}
+	flag.Usage = func() {
+		fmt.Fprintf(flag.CommandLine.Output(), "usage: a2a-layer [-config agents.yaml] [-check] [-version]\n"+
+			"       a2a-layer dashboard [-config agents.yaml] [-listen 127.0.0.1:7301]\n\n")
+		flag.PrintDefaults()
+	}
 	cfgPath := flag.String("config", "agents.yaml", "the YAML file defining the agents")
 	check := flag.Bool("check", false, "load and validate the config, print the agents, and exit")
 	showVersion := flag.Bool("version", false, "print the version and exit")
@@ -51,19 +64,13 @@ func run(cfgPath string, check bool, log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	runners := map[string]runner.Runner{}
+	runners, err := server.NewRunners(cfg)
+	if err != nil {
+		return err
+	}
 	for name, rc := range cfg.Runners {
-		r, err := runner.New(rc.Type, runner.Options{Command: rc.Command, Args: rc.Args, Env: rc.Env})
-		if err != nil {
-			return fmt.Errorf("runner %s: %w", name, err)
-		}
-		runners[name] = r
-		bin := rc.Command
-		if bin == "" {
-			bin = rc.Type
-		}
-		if _, err := exec.LookPath(bin); err != nil {
-			log.Warn("runner command not found on PATH; tasks on it will fail", "runner", name, "command", bin)
+		if _, err := exec.LookPath(rc.Bin()); err != nil {
+			log.Warn("runner command not found on PATH; tasks on it will fail", "runner", name, "command", rc.Bin())
 		}
 	}
 	srv, err := server.New(cfg, runners, log)

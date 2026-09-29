@@ -9,8 +9,8 @@
 // called through it.
 //
 // The proxy's upstream client offers no interactive capabilities (no elicitation), so a server
-// that asks a human before a risky call, such as a Delegent gateway, sends the ask to its own
-// console rather than to the headless CLI.
+// that asks a human before a risky call sends the ask to its own console or channel rather than
+// to the headless CLI, which could not answer it.
 package mcpproxy
 
 import (

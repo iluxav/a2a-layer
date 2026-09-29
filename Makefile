@@ -2,6 +2,7 @@
 #
 #   make build       build ./a2a-layer
 #   make run         build, then serve the agents in CONFIG
+#   make dashboard   build, then open the web UI that edits CONFIG (http://127.0.0.1:7301)
 #   make install     build, then copy a2a-layer into BINDIR (default /usr/local/bin)
 #   make uninstall   remove it from BINDIR
 #   make test        vet and test
@@ -19,13 +20,16 @@ BINDIR  ?= $(PREFIX)/bin
 CONFIG  ?= examples/delegent-team.yaml
 BIN     := a2a-layer
 
-.PHONY: build run install uninstall test clean
+.PHONY: build run dashboard install uninstall test clean
 
 build:
 	go build -ldflags "-s -w -X main.version=$(VERSION)" -o $(BIN) ./cmd/a2a-layer
 
 run: build
 	./$(BIN) -config "$(CONFIG)"
+
+dashboard: build
+	./$(BIN) dashboard -config "$(CONFIG)"
 
 install: build
 	@mkdir -p "$(BINDIR)" 2>/dev/null || true

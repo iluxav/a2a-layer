@@ -10,6 +10,7 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -54,6 +55,14 @@ type Runner struct {
 	Env map[string]string `yaml:"env"`
 }
 
+// Bin is the executable the runner starts: Command, or else the implementation's name.
+func (r Runner) Bin() string {
+	if r.Command != "" {
+		return r.Command
+	}
+	return r.Type
+}
+
 // Agent is one A2A agent: its card, what runs it, and the MCP servers it may use.
 type Agent struct {
 	Name         string  `yaml:"-"`
@@ -72,8 +81,29 @@ type Agent struct {
 	// Secret, when set, is the bearer token a caller must present.
 	Secret string `yaml:"secret"`
 
-	// MCP are the servers the agent may use, by name. Nothing else is available to it.
+	// MCP are the servers the agent may use, by name.
 	MCP map[string]MCPServer `yaml:"mcp"`
+	// BuiltinTools opens the seal: the runner's own tools the agent may use, as permission
+	// rules in the CLI's syntax (for claude: Bash, Read, Bash(lspci *)), or [default] for all
+	// of them with every call allowed. They act on this machine as the user a2a-layer runs
+	// as. Default none: the agent acts only through MCP.
+	BuiltinTools []string `yaml:"builtin_tools"`
+
+	// Context makes the agent remember earlier tasks of the same A2A context.
+	Context Context `yaml:"context"`
+}
+
+// Context configures conversations: with Remember on, the tasks a caller sends under one A2A
+// contextId run one after another in one CLI session, so each sees what the earlier ones did.
+// Tasks of different contexts never share anything.
+type Context struct {
+	Remember bool `yaml:"remember"`
+	// IdleTimeout ends a conversation nobody has used for this long (default 1h); its session
+	// and directory are deleted.
+	IdleTimeout Duration `yaml:"idle_timeout"`
+	// MaxTasks starts the conversation's session afresh after this many tasks (default 20), so
+	// the prompt it carries cannot grow without bound.
+	MaxTasks int `yaml:"max_tasks"`
 }
 
 // Skill is one entry of the agent card's skill list.
@@ -90,7 +120,8 @@ type MCPServer struct {
 	URL     string            `yaml:"url"`
 	Headers map[string]string `yaml:"headers"`
 	// ForwardHeaders are copied from the A2A request that started a task onto every call the
-	// task makes to this server (e.g. X-Delegent-Session, so a gateway can chain the hops).
+	// task makes to this server (for example a session or trace header, so a gateway in front of
+	// the servers can link the calls to the request that caused them).
 	ForwardHeaders []string `yaml:"forward_headers"`
 	// Tools limits the agent to these tools of the server. Empty allows all of them.
 	Tools []string `yaml:"tools"`
@@ -114,6 +145,9 @@ const (
 	DefaultMaxTurns = 30
 	DefaultTimeout  = 15 * time.Minute
 	DefaultRunner   = "claude"
+	// A conversation ends after this long unused, and restarts its session after this many tasks.
+	DefaultContextIdle  = time.Hour
+	DefaultContextTasks = 20
 )
 
 var (
@@ -128,17 +162,31 @@ func Load(path string) (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	c, err := Parse(raw, filepath.Dir(path))
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+	if len(c.Agents) == 0 {
+		return nil, fmt.Errorf("%s: no agents defined", path)
+	}
+	return c, nil
+}
+
+// Parse expands, defaults and validates a config read from a file in dir (env_file and
+// work_dir are relative to it). Unlike Load it accepts a config with no agents yet, which the
+// dashboard starts from.
+func Parse(raw []byte, dir string) (*Config, error) {
 	// A first, unexpanded pass finds env_file, so it can feed the expansion.
 	var pre struct {
 		EnvFile string `yaml:"env_file"`
 	}
 	if err := yaml.Unmarshal(raw, &pre); err != nil {
-		return nil, fmt.Errorf("%s: %w", path, err)
+		return nil, err
 	}
 	if pre.EnvFile != "" {
 		envPath := pre.EnvFile
 		if !filepath.IsAbs(envPath) {
-			envPath = filepath.Join(filepath.Dir(path), envPath)
+			envPath = filepath.Join(dir, envPath)
 		}
 		if err := LoadEnvFile(envPath); err != nil {
 			return nil, err
@@ -148,23 +196,25 @@ func Load(path string) (*Config, error) {
 	// misspelled key is an error rather than silently ignored.
 	var doc yaml.Node
 	if err := yaml.Unmarshal(raw, &doc); err != nil {
-		return nil, fmt.Errorf("%s: %w", path, err)
-	}
-	if err := expandNode(&doc); err != nil {
-		return nil, fmt.Errorf("%s: %w", path, err)
-	}
-	expanded, err := yaml.Marshal(&doc)
-	if err != nil {
-		return nil, fmt.Errorf("%s: %w", path, err)
+		return nil, err
 	}
 	var c Config
-	dec := yaml.NewDecoder(strings.NewReader(string(expanded)))
-	dec.KnownFields(true)
-	if err := dec.Decode(&c); err != nil {
-		return nil, fmt.Errorf("%s: %w", path, err)
+	if doc.Kind != 0 { // an empty file is an empty config
+		if err := expandNode(&doc); err != nil {
+			return nil, err
+		}
+		expanded, err := yaml.Marshal(&doc)
+		if err != nil {
+			return nil, err
+		}
+		dec := yaml.NewDecoder(strings.NewReader(string(expanded)))
+		dec.KnownFields(true)
+		if err := dec.Decode(&c); err != nil && !errors.Is(err, io.EOF) {
+			return nil, err
+		}
 	}
-	if err := c.finish(filepath.Dir(path)); err != nil {
-		return nil, fmt.Errorf("%s: %w", path, err)
+	if err := c.finish(dir); err != nil {
+		return nil, err
 	}
 	return &c, nil
 }
@@ -227,9 +277,6 @@ func (c *Config) finish(dir string) error {
 		}
 		c.Runners[name] = r
 	}
-	if len(c.Agents) == 0 {
-		return errors.New("no agents defined")
-	}
 	var errs []error
 	for name, a := range c.Agents {
 		if a == nil {
@@ -279,6 +326,12 @@ func (c *Config) finishAgent(a *Agent) error {
 	if a.Timeout == 0 {
 		a.Timeout = Duration(DefaultTimeout)
 	}
+	if a.Context.IdleTimeout <= 0 {
+		a.Context.IdleTimeout = Duration(DefaultContextIdle)
+	}
+	if a.Context.MaxTasks <= 0 {
+		a.Context.MaxTasks = DefaultContextTasks
+	}
 	if a.MaxParallel <= 0 {
 		a.MaxParallel = 1
 	}
@@ -297,6 +350,14 @@ func (c *Config) finishAgent(a *Agent) error {
 		}
 		if s.Name == "" {
 			a.Skills[i].Name = s.ID
+		}
+	}
+	for _, t := range a.BuiltinTools {
+		if strings.TrimSpace(t) == "" {
+			return errors.New("builtin_tools has an empty entry")
+		}
+		if t == "default" && len(a.BuiltinTools) > 1 {
+			return errors.New("builtin_tools: default already allows every built-in tool, so list it alone")
 		}
 	}
 	for name, m := range a.MCP {

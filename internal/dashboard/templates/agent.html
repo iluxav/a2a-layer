@@ -1,0 +1,93 @@
+{{define "title"}}{{or .Agent.Original "New agent"}}{{end}}
+
+{{define "content"}}
+{{with .Agent}}
+<div class="page-head">
+  <div>
+    <p class="crumb"><a href="/agents">Agents</a> /</p>
+    <h1>{{or .Original "New agent"}}</h1>
+  </div>
+  {{with .Original}}<a class="btn" href="/playground?agent={{.}}">Try it</a>{{end}}
+</div>
+
+<form method="post" action="/agents" class="form" hx-push-url="false">
+  <input type="hidden" name="original" value="{{.Original}}">
+
+  <fieldset>
+    <legend>Card</legend>
+    <div class="grid">
+      <label>Name <input name="name" value="{{.Name}}" required placeholder="pm" autocomplete="off">
+        <small>Its URL path: lowercase letters, digits, - and _.</small></label>
+      <label>Version <input name="version" value="{{.Version}}" placeholder="1.0.0"></label>
+      <label class="wide">Description <textarea name="description" rows="2" required placeholder="What callers see on the agent's card.">{{.Description}}</textarea></label>
+    </div>
+  </fieldset>
+
+  <fieldset>
+    <legend>Instructions</legend>
+    <label class="wide"><textarea name="instructions" rows="12" class="mono" placeholder="You are the product manager of a small team…">{{.Instructions}}</textarea>
+      <small>The agent's role, added to the CLI's system prompt. The common instructions (Settings) follow it.</small></label>
+  </fieldset>
+
+  <fieldset>
+    <legend>Running</legend>
+    <div class="grid">
+      <label>Runner
+        <select name="runner">
+          <option value="">{{with $.DefaultRunner}}default ({{.}}){{else}}pick one…{{end}}</option>
+          {{range $.RunnerNames}}<option value="{{.}}"{{if eq . $.Agent.Runner}} selected{{end}}>{{.}}</option>{{end}}
+        </select></label>
+      <label>Model <input name="model" value="{{.Model}}" list="models" placeholder="the runner's"></label>
+      <label>Max turns <input name="max_turns" value="{{.MaxTurns}}" inputmode="numeric" placeholder="the runner's, or 30"></label>
+      <label>Timeout <input name="timeout" value="{{.Timeout}}" placeholder="the runner's, or 15m"></label>
+      <label>Max parallel <input name="max_parallel" value="{{.MaxParallel}}" inputmode="numeric" placeholder="1">
+        <small>Tasks beyond this wait their turn.</small></label>
+      <label>Secret <input name="secret" value="{{.Secret}}" placeholder="${PM_SECRET}" autocomplete="off" spellcheck="false">
+        <small>Callers send it as a bearer token. <code>${NAME}</code> reads the environment or env file.</small></label>
+    </div>
+    <datalist id="models"><option value="haiku"><option value="sonnet"><option value="opus"></datalist>
+  </fieldset>
+
+  <fieldset>
+    <legend>Conversations</legend>
+    <label class="check"><input type="checkbox" name="remember" value="true"{{if .Remember}} checked{{end}}>
+      Remember earlier tasks of the same A2A context</label>
+    <div class="grid">
+      <label>Idle timeout <input name="idle_timeout" value="{{.IdleTimeout}}" placeholder="1h">
+        <small>A conversation unused this long ends.</small></label>
+      <label>Max tasks <input name="max_tasks" value="{{.MaxTasks}}" inputmode="numeric" placeholder="20">
+        <small>Then its session starts afresh.</small></label>
+    </div>
+  </fieldset>
+
+  <fieldset>
+    <legend>MCP servers</legend>
+    <p class="hint">The agent reaches these servers' allowed tools only. Unless it has built-in tools (below), they are all it can act through.</p>
+    <div id="mcp-rows" class="rows">{{range .MCP}}{{template "mcp-row" .}}{{end}}</div>
+    <button type="button" class="btn" hx-get="/parts/mcp" hx-target="#mcp-rows" hx-swap="beforeend">Add MCP server</button>
+  </fieldset>
+
+  <fieldset>
+    <legend>Built-in tools</legend>
+    <p class="hint">None by default, so the agent acts only through its MCP servers. Tools listed here
+      are the CLI's own (shell, files, web) and <strong>act on this machine</strong>, as the user a2a-layer runs as.</p>
+    <label class="wide"><textarea name="builtin_tools" rows="3" class="mono" spellcheck="false" placeholder="Bash(lspci *)&#10;Read">{{.BuiltinTools}}</textarea>
+      <small><code>default</code> alone gives every built-in tool with every call allowed, like approving each one.
+        Or one permission rule per line: a whole tool (<code>Bash</code>, <code>Read</code>, <code>WebFetch</code>) or a narrower rule
+        (<code>Bash(lspci *)</code> allows only commands starting with <code>lspci</code>); anything not listed is refused.</small></label>
+  </fieldset>
+
+  <fieldset>
+    <legend>Skills</legend>
+    <p class="hint">What the agent's card offers. Without any, the card lists one skill named after the agent.</p>
+    <div id="skill-rows" class="rows">{{range .Skills}}{{template "skill-row" .}}{{end}}</div>
+    <button type="button" class="btn" hx-get="/parts/skill" hx-target="#skill-rows" hx-swap="beforeend">Add skill</button>
+  </fieldset>
+
+  <div class="actions">
+    <button class="btn primary">Save agent</button>
+    <a class="btn ghost" href="/agents">Cancel</a>
+  </div>
+</form>
+{{end}}
+{{end}}

@@ -1,0 +1,32 @@
+{{define "layout"}}<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{template "title" .}} · a2a-layer</title>
+<link rel="stylesheet" href="/static/style.css">
+<script src="/static/htmx.min.js"></script>
+<script src="/static/app.js"></script>
+</head>
+<body hx-boost="true">
+<header class="top">
+  <a class="brand" href="/agents"><span class="mark">a2a</span>layer</a>
+  <nav>
+    <a href="/agents"{{if eq .Tab "agents"}} class="on"{{end}}>Agents</a>
+    <a href="/runners"{{if eq .Tab "runners"}} class="on"{{end}}>Runners</a>
+    <a href="/settings"{{if eq .Tab "settings"}} class="on"{{end}}>Settings</a>
+    <a href="/playground"{{if eq .Tab "playground"}} class="on"{{end}}>Playground</a>
+  </nav>
+  <code class="file" title="The config file this dashboard edits: {{.Path}}"><bdi>{{.Path}}</bdi></code>
+</header>
+<main>
+{{with .Flash}}<div class="banner ok">{{.}}</div>{{end}}
+{{with .Error}}<div class="banner error"><strong>Not saved.</strong><ul>{{range .}}<li>{{.}}</li>{{end}}</ul></div>{{end}}
+{{if .Problems}}<details class="banner warn"{{if not .Error}} open{{end}}>
+  <summary>The config file has {{len .Problems}} problem{{if gt (len .Problems) 1}}s{{end}}: a2a-layer will not start until {{if gt (len .Problems) 1}}they are{{else}}it is{{end}} fixed.</summary>
+  <ul>{{range .Problems}}<li>{{.}}</li>{{end}}</ul>
+</details>{{end}}
+{{template "content" .}}
+</main>
+</body>
+</html>{{end}}
