@@ -33,6 +33,9 @@ type Config struct {
 	WorkDir string `yaml:"work_dir"`
 	// CommonInstructions are appended to every agent's instructions.
 	CommonInstructions string `yaml:"common_instructions"`
+	// MCPWait is how long a call to an agent's MCP endpoint waits for its task before
+	// answering that it is still working (default 50s: MCP clients time tool calls out).
+	MCPWait Duration `yaml:"mcp_wait"`
 	// CLI adjusts how a CLI is run on this machine, by its name (claude, codex). Optional:
 	// without it each CLI runs as its own command on PATH, under its usual login.
 	CLI map[string]CLI `yaml:"cli"`
@@ -141,6 +144,7 @@ const (
 	DefaultMaxTurns = 30
 	DefaultTimeout  = 15 * time.Minute
 	DefaultCLI      = "claude"
+	DefaultMCPWait  = 50 * time.Second
 	// A conversation ends after this long unused, and restarts its session after this many tasks.
 	DefaultContextIdle  = time.Hour
 	DefaultContextTasks = 20
@@ -294,6 +298,12 @@ func (c *Config) finish(dir string) error {
 		c.WorkDir = filepath.Join(dir, c.WorkDir)
 	}
 	var errs []error
+	switch {
+	case c.MCPWait < 0:
+		errs = append(errs, errors.New("mcp_wait cannot be negative"))
+	case c.MCPWait == 0:
+		c.MCPWait = Duration(DefaultMCPWait)
+	}
 	for name, a := range c.Agents {
 		if a == nil {
 			a = &Agent{}

@@ -28,18 +28,13 @@ document.addEventListener("click", (e) => {
     return;
   }
 
-  // Continue a run's conversation: pick its agent and context, then write the next message.
-  const cont = e.target.closest(".continue[data-context]");
-  if (cont) {
-    const agent = document.getElementById("play-agent");
-    if (agent && agent.value !== cont.dataset.agent) {
-      agent.value = cont.dataset.agent;
-      htmx.trigger(agent, "change");
-    }
-    document.getElementById("play-context").value = cont.dataset.context;
-    const msg = document.getElementById("play-message");
-    msg.value = "";
-    msg.focus();
+  // Copy an answer, as the agent wrote it.
+  const copy = e.target.closest("[data-copy]");
+  if (copy) {
+    navigator.clipboard.writeText(copy.dataset.copy).then(() => {
+      copy.textContent = "Copied";
+      setTimeout(() => (copy.textContent = "Copy"), 1500);
+    });
   }
 });
 
@@ -51,11 +46,40 @@ document.addEventListener("keydown", (e) => {
   }
 });
 
+// A message was sent: clear it, and follow the conversation to its end.
+document.addEventListener("run-sent", () => {
+  const msg = document.getElementById("play-message");
+  if (msg) msg.value = "";
+  document.querySelectorAll(".composer .note").forEach((n) => n.remove());
+  followThread = true;
+});
+
+// The conversation shown scrolls with the page. Keep it at its latest message while the reader
+// is there, as a running task's log grows or its answer arrives.
+let followThread = true;
+window.addEventListener("scroll", () => {
+  followThread = window.innerHeight + window.scrollY >= document.documentElement.scrollHeight - 80;
+});
+function toEnd() {
+  if (document.getElementById("thread") && followThread) {
+    window.scrollTo(0, document.documentElement.scrollHeight);
+  }
+}
+
 // Keep a running task's log scrolled to its latest note.
 document.addEventListener("htmx:afterSettle", () => {
   document.querySelectorAll(".run[hx-get] .log").forEach((log) => {
     log.scrollTop = log.scrollHeight;
   });
+  toEnd();
+});
+document.addEventListener("htmx:load", (e) => {
+  // A page opened (or a conversation started): show its latest message.
+  const elt = e.detail.elt;
+  if (elt.id === "chat" || (elt.querySelector && elt.querySelector("#chat"))) {
+    followThread = true;
+    toEnd();
+  }
 });
 
 // Highlight the model chip that matches the Model field.

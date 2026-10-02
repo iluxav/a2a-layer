@@ -7,6 +7,7 @@ endpoint on one port:
 ```
 http://127.0.0.1:7300/pm          ← JSON-RPC (message/send, tasks/get, tasks/cancel)
 http://127.0.0.1:7300/pm/.well-known/agent-card.json
+http://127.0.0.1:7300/pm/mcp      ← the same agent as an MCP server, for MCP-only clients
 http://127.0.0.1:7300/engineer
 http://127.0.0.1:7300/                ← index of the agents
 ```
@@ -55,6 +56,32 @@ curl -s localhost:7300/helper -H 'Content-Type: application/json' -d '{
 Without `configuration.blocking: false` the call waits for the answer; with it, you get the task
 back at once and poll `tasks/get`.
 
+## Calling agents over MCP
+
+Most harnesses (Claude Code, Codex, ChatGPT, pi) call MCP servers but not A2A agents, so every
+agent is also a Streamable HTTP MCP server at `/<agent>/mcp`. Each of its skills is a tool taking
+`{message, context_id?}`, and two more tools follow a task: `get_task {task_id}` and
+`cancel_task {task_id}`.
+
+```sh
+claude mcp add --transport http pm http://127.0.0.1:7300/pm/mcp --header "Authorization: Bearer $PM_SECRET"
+codex mcp add pm --url http://127.0.0.1:7300/pm/mcp --bearer-token-env-var PM_SECRET
+```
+
+A call starts a task exactly as `message/send` does (the same instructions, MCP servers,
+forwarded headers and conversations; A2A's `tasks/get` sees it too) and waits for it, but only
+up to `mcp_wait` (default 50s), since MCP clients time tool calls out and a task can take many
+minutes. A task that finishes in time returns its answer. One that does not returns
+`state: working` with its `task_id`, and `get_task` waits for it again. Every result carries
+`{task_id, context_id, state, answer, status, next}` as structured content; pass `context_id`
+back to continue a conversation with an agent that remembers. A client that asks for progress
+gets the task's notes ("calling linear__get_issue") as progress notifications.
+
+The endpoint takes the agent's `secret` as a bearer token, like its A2A endpoint. The dashboard
+shows each agent's commands. Cloud clients (ChatGPT connectors, the Claude apps) need a public
+HTTPS URL to reach it; behind a reverse proxy, set `public_url`, and the endpoint accepts requests
+under that host name (otherwise it refuses any host but a loopback one, against DNS rebinding).
+
 ## Dashboard
 
 ```sh
@@ -72,10 +99,12 @@ embedded):
 - **Settings**: listen address, public URL, env file, work dir and the common instructions, and
   (optional) how each CLI is run: its command, extra arguments and environment. It also shows
   whether each CLI is found.
-- **Playground**: send an agent a message and follow its task as it runs: progress, answer,
-  turns, tokens and cost. An agent that remembers can be continued in the same conversation.
-  The agents run inside the dashboard, exactly as a2a-layer would run them, from the config as
-  it is now; a2a-layer need not be running.
+- **Playground**: chat with an agent and follow each task as it runs: progress, answer
+  (rendered from Markdown), turns, tokens and cost. Each conversation is one thread, listed on
+  the side; an agent that remembers is continued by replying in its thread, one that does not
+  starts a new conversation with every message. Conversations are kept while the dashboard
+  runs (the last 50). The agents run inside the dashboard, exactly as a2a-layer would run them,
+  from the config as it is now; a2a-layer need not be running.
 
 Every change is written back to the file right away. Only the entry you changed is rewritten:
 the rest of the file keeps its comments, layout and `${NAME}` references, and the forms show
@@ -173,6 +202,7 @@ env_file: .env                  # loaded before ${NAME} expansion, relative to t
 work_dir: /var/tmp/a2a          # where task scratch dirs go (default: system temp)
 common_instructions: |          # appended to every agent's instructions
   …
+mcp_wait: 50s                   # how long an MCP tool call waits for its task (default 50s)
 
 cli:                            # optional: how a CLI is run on this machine, for all its agents
   claude:                       # or codex
@@ -298,7 +328,8 @@ The server and config need no changes.
 
 - `cmd/a2a-layer` – the binary: flags, HTTP server, shutdown, the `dashboard` command
 - `internal/config` – the YAML schema, `${NAME}` expansion, defaults and validation
-- `internal/server` – A2A over HTTP: routing per agent, auth, tasks, running them
+- `internal/server` – A2A over HTTP: routing per agent, auth, tasks, running them; each agent's
+  MCP endpoint
 - `internal/dashboard` – the web UI: config editing (entry by entry), the playground, embedded
   templates and assets
 - `internal/mcpproxy` – each task's filtered, private view of its MCP servers

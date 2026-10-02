@@ -1,48 +1,100 @@
 {{define "title"}}Playground{{end}}
 
-{{define "content"}}
-<div class="page-head">
-  <div>
-    <h1>Playground</h1>
-    <p class="sub">Send an agent a message and follow its task. The agents run here, as the config file defines them now: a2a-layer need not be running.</p>
-  </div>
-</div>
-{{with .Play}}
-{{if .Unready}}
-<div class="empty">
-  <p>Nothing to run yet: {{.Unready}}.</p>
-  <a class="btn primary" href="/agents/new">New agent</a>
-</div>
-{{else}}
-<div class="play">
-  <form class="panel" id="play-form" hx-post="/playground/runs" hx-target="#runs" hx-swap="afterbegin"
-        hx-push-url="false" hx-disabled-elt="find .btn.primary">
-    <label>Agent
-      <select name="agent" id="play-agent" hx-get="/playground/agent" hx-target="#agent-info" hx-trigger="change">
-        {{range .Agents}}<option value="{{.Name}}"{{if eq .Name $.Play.Agent}} selected{{end}}>{{.Name}}</option>{{end}}
-      </select>
-    </label>
-    <div id="agent-info">{{template "agent-info" .Selected}}</div>
-    <label>Message
-      <textarea name="message" id="play-message" rows="6" required placeholder="What should the agent do?"></textarea></label>
-    <label>Conversation
-      <input name="context" id="play-context" class="mono" placeholder="a new one" autocomplete="off" spellcheck="false">
-      <small>An A2A context id. Empty starts a new conversation; an agent that remembers continues the one named.</small></label>
-    <details>
-      <summary>Request headers</summary>
-      <label><textarea name="headers" rows="2" class="mono" placeholder="X-Session-Id: abc123"></textarea>
-        <small>Sent with the A2A request. The agent passes on those its MCP servers list in forward headers.</small></label>
-    </details>
-    <div class="actions">
-      <button class="btn primary">Send</button>
-      <span class="muted small"><kbd>Ctrl</kbd> + <kbd>Enter</kbd></span>
+{{define "content"}}{{template "chat" .Play}}{{end}}
+
+{{/* The conversations and the one shown. A message that starts a conversation swaps it all. */}}
+{{define "chat"}}
+<div class="chat" id="chat">
+  <aside class="convs">
+    <a class="btn primary new-conv" href="/playground{{with .Agent}}?agent={{.}}{{end}}">New conversation</a>
+    {{template "conv-list" .List}}
+  </aside>
+  <section class="pane">
+    <header class="pane-head">
+      {{with .Conv}}
+      <div class="grow">
+        <h1 title="{{.Title}}">{{.Title}}</h1>
+        <p class="muted small"><strong class="mono">{{.Agent}}</strong> · context <code title="The A2A context id">{{.ContextID}}</code></p>
+      </div>
+      {{else}}
+      <div class="grow">
+        <h1>New conversation</h1>
+        <p class="muted small">The agents run here, as the config file defines them now: a2a-layer need not be running.</p>
+      </div>
+      {{end}}
+    </header>
+    {{if .Gone}}<p class="note">That conversation is gone: the dashboard keeps conversations only while it runs.</p>{{end}}
+    <div id="thread" class="thread">
+      {{range .Runs}}{{template "run" .}}{{end}}
+      {{if and (not .Conv) .Selected}}<div id="agent-info">{{template "agent-info" .Selected}}</div>{{end}}
     </div>
-  </form>
-  <section id="runs" class="runs">
-    {{range .Runs}}{{template "run" .}}{{end}}
-    <p class="empty-runs muted">Runs show up here, newest first.</p>
+    {{template "composer" .}}
   </section>
 </div>
 {{end}}
+
+{{define "conv-list"}}
+<nav class="conv-list" id="conv-list"{{if .OOB}} hx-swap-oob="true"{{end}}{{if .Polling}} hx-get="/playground/conversations?c={{.Conv}}" hx-trigger="every 2s" hx-swap="outerHTML"{{end}}>
+  {{range .Conversations}}
+  <a class="conv{{if .On}} on{{end}}" href="/playground?c={{.ID}}" title="{{.Title}}">
+    <span class="conv-title">{{if .Running}}<span class="live" title="Running"></span>{{end}}{{.Title}}</span>
+    <span class="conv-sub"><span class="mono">{{.Agent}}</span> · {{.Age}}</span>
+  </a>
+  {{else}}
+  <p class="muted small conv-none">Your conversations show up here while the dashboard runs.</p>
+  {{end}}
+</nav>
+{{end}}
+
+{{define "composer"}}
+{{if .Unready}}
+<div class="composer blocked">
+  <p>Nothing to run yet: {{.Unready}}.</p>
+  <a class="btn primary" href="/agents/new">New agent</a>
+</div>
+{{else if .Blocked}}
+<div class="composer blocked">
+  <p>{{.Blocked}}</p>
+  {{with .Selected}}<a class="btn" href="/agents/{{.Name}}/edit">Edit {{.Name}}</a>{{end}}
+  <a class="btn primary" href="/playground?agent={{.Agent}}">New conversation</a>
+</div>
+{{else}}
+<form class="composer" id="play-form" hx-post="/playground/runs" hx-target="#thread" hx-swap="beforeend"
+      hx-push-url="false" hx-disabled-elt="find .btn.primary">
+  {{with .Conv}}<input type="hidden" name="conversation" value="{{.ID}}">{{end}}
+  {{if .Stale}}<p class="note">The config changed since the last message: the agent will not remember the messages above.</p>{{end}}
+  <textarea name="message" id="play-message" rows="3" required
+    placeholder="{{if .Conv}}Reply to {{.Agent}}{{else}}What should the agent do?{{end}}"></textarea>
+  <div class="composer-bar">
+    {{if .Conv}}
+    <input type="hidden" name="agent" value="{{.Agent}}">
+    {{else}}
+    <label class="inline">Agent
+      <select name="agent" id="play-agent" hx-get="/playground/agent" hx-target="#agent-info" hx-trigger="change">
+        {{range .Agents}}<option value="{{.Name}}"{{if eq .Name $.Agent}} selected{{end}}>{{.Name}}</option>{{end}}
+      </select>
+    </label>
+    {{end}}
+    <details class="options">
+      <summary>Options</summary>
+      <div class="options-body">
+        {{if not .Conv}}
+        <label>Context id
+          <input name="context" class="mono" placeholder="a new one" autocomplete="off" spellcheck="false">
+          <small>An A2A context id. Empty starts a new one; an agent that remembers continues the one named.</small></label>
+        {{end}}
+        <label>Request headers
+          <textarea name="headers" rows="2" class="mono" placeholder="X-Session-Id: abc123">{{.Headers}}</textarea>
+          <small>Sent with the A2A request. The agent passes on those its MCP servers list in forward headers.</small></label>
+      </div>
+    </details>
+    <span class="grow"></span>
+    <span class="muted small"><kbd>Ctrl</kbd> + <kbd>Enter</kbd></span>
+    <button class="btn primary">Send</button>
+  </div>
+</form>
 {{end}}
 {{end}}
+
+{{/* What sending a message in a conversation adds: the run, and (out of band) the list. */}}
+{{define "sent"}}{{template "run" .Run}}{{template "conv-list" .List}}{{end}}

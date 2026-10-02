@@ -20,6 +20,8 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/modelcontextprotocol/go-sdk/mcp"
+
 	"github.com/iluxav/a2a-layer/internal/a2a"
 	"github.com/iluxav/a2a-layer/internal/config"
 	"github.com/iluxav/a2a-layer/internal/mcpproxy"
@@ -48,6 +50,9 @@ type agent struct {
 	card   a2a.AgentCard
 	slots  chan struct{} // MaxParallel tokens
 	prompt string        // instructions + common instructions
+
+	mcpServer *mcp.Server  // the agent as an MCP server, at /<agent>/mcp
+	mcp       http.Handler // serves mcpServer
 }
 
 // Option adjusts a Server as New builds it.
@@ -84,7 +89,9 @@ func New(cfg *config.Config, runners map[string]runner.Runner, log *slog.Logger,
 		if c := strings.TrimSpace(cfg.CommonInstructions); c != "" {
 			prompt = strings.TrimSpace(prompt + "\n\n" + c)
 		}
-		s.agents[name] = &agent{cfg: a, runner: r, card: cardFor(cfg.PublicURL, a), slots: make(chan struct{}, a.MaxParallel), prompt: prompt}
+		ag := &agent{cfg: a, runner: r, card: cardFor(cfg.PublicURL, a), slots: make(chan struct{}, a.MaxParallel), prompt: prompt}
+		ag.mcpServer, ag.mcp = s.mcpEndpointFor(ag)
+		s.agents[name] = ag
 	}
 	go s.sweepLoop()
 	return s, nil
@@ -94,6 +101,11 @@ func New(cfg *config.Config, runners map[string]runner.Runner, log *slog.Logger,
 // directories are deleted: the conversations live in memory, so nothing could resume them).
 func (s *Server) Shutdown() {
 	s.stop()
+	for _, a := range s.agents {
+		for ss := range a.mcpServer.Sessions() {
+			ss.Close() // so no MCP client's stream holds the listener open
+		}
+	}
 	deadline := time.Now().Add(10 * time.Second)
 	for s.convs.count() > 0 && time.Now().Before(deadline) {
 		s.endConversations(s.convs.sweep(time.Now(), true))
@@ -229,6 +241,10 @@ func (s *Server) agentHandler() http.Handler {
 	mux.HandleFunc("GET /{agent}", s.cardHandler)
 	mux.HandleFunc("POST /{agent}", s.rpc)
 	mux.HandleFunc("POST /{agent}/", s.rpc)
+	// The agent as an MCP server. With methods, so these are more specific than POST /{agent}/.
+	for _, method := range []string{"GET", "POST", "DELETE"} {
+		mux.HandleFunc(method+" /{agent}/mcp", s.mcpEndpoint)
+	}
 	return mux
 }
 
@@ -264,9 +280,7 @@ func (s *Server) rpc(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	if a.cfg.Secret != "" && !bearerMatches(r.Header.Get("Authorization"), a.cfg.Secret) {
-		w.Header().Set("WWW-Authenticate", `Bearer realm="`+a.cfg.Name+`"`)
-		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+	if !authorized(w, r, a) {
 		return
 	}
 	var req a2a.Request
@@ -293,6 +307,30 @@ func (s *Server) rpc(w http.ResponseWriter, r *http.Request) {
 		rpcErr = &a2a.Error{Code: a2a.CodeMethodNotFound, Message: "method " + req.Method + " is not supported (message/send, tasks/get, tasks/cancel are)"}
 	}
 	writeRPC(w, req.ID, result, rpcErr)
+}
+
+// mcpEndpoint serves the agent's MCP server, to callers with its secret.
+func (s *Server) mcpEndpoint(w http.ResponseWriter, r *http.Request) {
+	a := s.agents[r.PathValue("agent")]
+	if a == nil {
+		http.NotFound(w, r)
+		return
+	}
+	if !authorized(w, r, a) {
+		return
+	}
+	a.mcp.ServeHTTP(w, r)
+}
+
+// authorized checks the caller's bearer token against the agent's secret, answering 401 if
+// it does not match.
+func authorized(w http.ResponseWriter, r *http.Request, a *agent) bool {
+	if a.cfg.Secret == "" || bearerMatches(r.Header.Get("Authorization"), a.cfg.Secret) {
+		return true
+	}
+	w.Header().Set("WWW-Authenticate", `Bearer realm="`+a.cfg.Name+`"`)
+	writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+	return false
 }
 
 // send starts a task. With configuration.blocking false it answers at once with the task,

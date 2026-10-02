@@ -4,6 +4,8 @@ go 1.25.0
 
 require gopkg.in/yaml.v3 v3.0.1
 
+require github.com/yuin/goldmark v1.8.6 // indirect
+
 require (
 	github.com/google/jsonschema-go v0.4.3 // indirect
 	github.com/modelcontextprotocol/go-sdk v1.6.1

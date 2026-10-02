@@ -26,10 +26,20 @@
     <p class="desc">{{.Description}}</p>
     <dl class="facts">
       <dt>CLI</dt><dd>{{.CLI}}{{with .Model}} · {{.}}{{end}}</dd>
-      <dt>MCP</dt><dd>{{if .MCP}}{{join .MCP ", "}}{{else}}<span class="muted">none</span>{{end}}</dd>
+      <dt>Uses MCP</dt><dd>{{if .MCP}}{{join .MCP ", "}}{{else}}<span class="muted">none</span>{{end}}</dd>
       {{with .Builtin}}<dt>Built-in</dt><dd>{{if eq (join . ",") "default"}}all{{else}}<span class="mono small">{{join . ", "}}</span>{{end}}</dd>{{end}}
-      {{with .URL}}<dt>URL</dt><dd><code>{{.}}</code></dd>{{end}}
+      {{with .URL}}<dt>A2A</dt><dd><code>{{.}}</code></dd>
+      <dt>MCP</dt><dd><code>{{.}}/mcp</code></dd>{{end}}
     </dl>
+    {{if .URL}}<details class="connect">
+      <summary>Call it from Claude Code or Codex</summary>
+      <p class="small muted">Each skill is a tool; a task that takes longer than the wait is polled with <code>get_task</code>.{{with .SecretEnv}} Set <code>{{.}}</code> to the agent's secret first.{{end}}</p>
+      <pre class="mono"><span class="muted"># Claude Code</span>
+claude mcp add --transport http {{.Name}} {{.URL}}/mcp{{with .SecretEnv}} --header "Authorization: Bearer ${{.}}"{{end}}
+
+<span class="muted"># Codex</span>
+codex mcp add {{.Name}} --url {{.URL}}/mcp{{with .SecretEnv}} --bearer-token-env-var {{.}}{{end}}</pre>
+    </details>{{end}}
     {{with .Problems}}<ul class="problems">{{range .}}<li>{{.}}</li>{{end}}</ul>{{end}}
     <footer>
       <a class="btn" href="/agents/{{.Name}}/edit">Edit</a>

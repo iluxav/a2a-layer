@@ -114,6 +114,7 @@ func newTestServerWith(t *testing.T, f *fakeRunner, maxParallel int, gatewayURL 
 		PublicURL:          "http://agents.local:7300",
 		WorkDir:            t.TempDir(),
 		CommonInstructions: "Be brief.",
+		MCPWait:            config.Duration(time.Second),
 		Agents: map[string]*config.Agent{
 			"pm": {
 				Name: "pm", Description: "Plans.", Version: "1.0.0", Instructions: "You are the PM.",

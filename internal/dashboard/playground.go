@@ -6,12 +6,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html/template"
 	"net/http"
 	"net/http/httptest"
 	"slices"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/iluxav/a2a-layer/internal/a2a"
 	"github.com/iluxav/a2a-layer/internal/config"
@@ -26,8 +28,8 @@ import (
 // is shut down once they finish. A conversation (an agent that remembers) therefore continues
 // only while the config is unchanged.
 
-// maxRuns is how many runs the playground lists.
-const maxRuns = 30
+// maxConversations is how many conversations the playground keeps, most recent first.
+const maxConversations = 50
 
 // playground is a server built from one version of the config.
 type playground struct {
@@ -36,6 +38,56 @@ type playground struct {
 	srv     *server.Server
 	active  int  // runs not finished yet; guarded by Dashboard.mu
 	retired bool // a newer config replaced it; guarded by Dashboard.mu
+}
+
+// conversation is the runs sent to one agent in one A2A context: a thread in the playground. An
+// agent that does not remember starts a new one with every message.
+type conversation struct {
+	ID, Agent, ContextID string
+	runs                 []*run    // oldest first; guarded by Dashboard.mu
+	updated              time.Time // when its last run was sent; guarded by Dashboard.mu
+}
+
+// convView is a conversation as the playground's list shows it.
+type convView struct {
+	ID, Agent, ContextID, Title, Age string
+	Running, On                      bool
+}
+
+// view describes c; call with d.mu held.
+func (c *conversation) view() convView {
+	v := convView{ID: c.ID, Agent: c.Agent, ContextID: c.ContextID, Age: age(time.Since(c.updated))}
+	if len(c.runs) > 0 {
+		v.Title = title(c.runs[0].Prompt)
+	}
+	for _, r := range c.runs {
+		r.mu.Lock()
+		v.Running = v.Running || !r.done
+		r.mu.Unlock()
+	}
+	return v
+}
+
+// title is the first line of a conversation's first message, cut short.
+func title(prompt string) string {
+	line, _, _ := strings.Cut(prompt, "\n")
+	if utf8.RuneCountInString(line) > 80 {
+		line = string([]rune(line)[:80]) + "…"
+	}
+	return line
+}
+
+// age says roughly how long ago something happened.
+func age(d time.Duration) string {
+	switch {
+	case d < time.Minute:
+		return "just now"
+	case d < time.Hour:
+		return fmt.Sprintf("%dm ago", int(d.Minutes()))
+	case d < 24*time.Hour:
+		return fmt.Sprintf("%dh ago", int(d.Hours()))
+	}
+	return fmt.Sprintf("%dd ago", int(d.Hours()/24))
 }
 
 // run is one message sent from the playground, followed until its task finishes.
@@ -58,6 +110,7 @@ type run struct {
 type runView struct {
 	ID, Agent, ContextID, Prompt, Note string
 	State, Answer, Failure             string
+	AnswerHTML                         template.HTML // the answer rendered from Markdown
 	Notes                              []string
 	Done, Remember, Stale              bool
 	Elapsed                            string
@@ -88,6 +141,9 @@ func (r *run) view(current *playground) runView {
 			v.Notes = v.Notes[:n-1]
 		}
 	}
+	if v.Answer != "" {
+		v.AnswerHTML = markdown(v.Answer)
+	}
 	if r.task.Status.State == a2a.StateFailed || r.task.Status.State == a2a.StateCanceled {
 		if m := r.task.Status.Message; m != nil {
 			v.Failure = m.Text()
@@ -98,7 +154,7 @@ func (r *run) view(current *playground) runView {
 	}
 	md := r.task.Metadata
 	add := func(label, key, format string) {
-		if x, ok := md[key]; ok {
+		if x, ok := md[key]; ok && x != "" {
 			v.Meta = append(v.Meta, metaItem{label, fmt.Sprintf(format, x)})
 		}
 	}
@@ -183,21 +239,34 @@ func (p *playground) call(agent, method string, params any, header http.Header) 
 	return resp.Result, nil
 }
 
-// startRun sends a message to an agent and follows its task in the background.
-func (d *Dashboard) startRun(agent, contextID, prompt string, header http.Header) (*run, error) {
+// startRun sends a message to an agent and follows its task in the background. The message
+// continues conversation convID; without one it starts a conversation, or joins the one
+// already holding contextID.
+func (d *Dashboard) startRun(convID, agent, contextID, prompt string, header http.Header) (*conversation, *run, error) {
 	pg, err := d.playground()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
+	}
+	var conv *conversation
+	if convID != "" {
+		if conv = d.findConversation(convID); conv == nil {
+			return nil, nil, errors.New("this conversation is gone: the dashboard keeps them only while it runs")
+		}
+		agent, contextID = conv.Agent, conv.ContextID
 	}
 	a := pg.cfg.Agents[agent]
 	if a == nil {
-		return nil, fmt.Errorf("no agent %q in the config", agent)
+		return nil, nil, fmt.Errorf("no agent %q in the config", agent)
+	}
+	if conv != nil && !a.Context.Remember {
+		return nil, nil, fmt.Errorf("%s does not remember earlier tasks: start a new conversation", agent)
+	}
+	if conv == nil && contextID != "" {
+		conv = d.findContext(agent, contextID)
 	}
 	var note string
-	if contextID != "" && a.Context.Remember {
-		if prev := d.findContext(agent, contextID); prev != nil && prev.pg != pg {
-			note = "The config changed since this conversation's last run, so this starts a new one."
-		}
+	if conv != nil && a.Context.Remember && d.stale(conv, pg) {
+		note = "The config changed since the last message, so the agent starts afresh here: it does not remember the messages above."
 	}
 	d.mu.Lock()
 	pg.active++
@@ -207,22 +276,36 @@ func (d *Dashboard) startRun(agent, contextID, prompt string, header http.Header
 	raw, err := pg.call(agent, "message/send", a2a.SendParams{Message: msg, Configuration: &a2a.SendConfig{Blocking: &blocking}}, header)
 	if err != nil {
 		d.finished(pg)
-		return nil, err
+		return nil, nil, err
 	}
 	var t a2a.Task
 	if err := json.Unmarshal(raw, &t); err != nil {
 		d.finished(pg)
-		return nil, err
+		return nil, nil, err
 	}
 	r := &run{ID: t.ID, Agent: agent, ContextID: t.ContextID, Prompt: prompt, Started: time.Now(), Remember: a.Context.Remember, Note: note, pg: pg, task: t}
 	d.mu.Lock()
-	d.runs = append([]*run{r}, d.runs...)
-	if len(d.runs) > maxRuns {
-		d.runs = d.runs[:maxRuns]
+	if conv == nil {
+		conv = &conversation{ID: newRow() + newRow(), Agent: agent, ContextID: t.ContextID}
+	}
+	conv.runs = append(conv.runs, r)
+	conv.updated = r.Started
+	d.convs = slices.DeleteFunc(d.convs, func(c *conversation) bool { return c == conv })
+	d.convs = append([]*conversation{conv}, d.convs...)
+	if len(d.convs) > maxConversations {
+		d.convs = d.convs[:maxConversations]
 	}
 	d.mu.Unlock()
 	go d.follow(r)
-	return r, nil
+	return conv, r, nil
+}
+
+// stale reports whether conv's last run was sent to an older config than pg: a remembering
+// agent no longer has the conversation.
+func (d *Dashboard) stale(conv *conversation, pg *playground) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return len(conv.runs) > 0 && conv.runs[len(conv.runs)-1].pg != pg
 }
 
 // follow polls a run's task until it finishes, keeping each progress note it reports.
@@ -281,20 +364,33 @@ func (d *Dashboard) cancelRun(r *run) error {
 func (d *Dashboard) findRun(id string) *run {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	for _, r := range d.runs {
-		if r.ID == id {
-			return r
+	for _, c := range d.convs {
+		for _, r := range c.runs {
+			if r.ID == id {
+				return r
+			}
 		}
 	}
 	return nil
 }
 
-func (d *Dashboard) findContext(agent, contextID string) *run {
+func (d *Dashboard) findConversation(id string) *conversation {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	for _, r := range d.runs {
-		if r.Agent == agent && r.ContextID == contextID {
-			return r
+	for _, c := range d.convs {
+		if c.ID == id {
+			return c
+		}
+	}
+	return nil
+}
+
+func (d *Dashboard) findContext(agent, contextID string) *conversation {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for _, c := range d.convs {
+		if c.Agent == agent && c.ContextID == contextID {
+			return c
 		}
 	}
 	return nil

@@ -67,7 +67,7 @@ type Dashboard struct {
 	modelCache map[string]listedModels // by runner type and command
 	play       *playground             // built from the file as it was last read
 	live       []*playground           // play, and replaced ones whose runs have not finished
-	runs       []*run                  // newest first
+	convs      []*conversation         // the playground's, most recently used first
 }
 
 // New builds the dashboard.
@@ -116,6 +116,7 @@ func (d *Dashboard) Handler() http.Handler {
 
 	mux.HandleFunc("GET /playground", d.playgroundPage)
 	mux.HandleFunc("GET /playground/agent", d.playgroundAgent)
+	mux.HandleFunc("GET /playground/conversations", d.conversationList)
 	mux.HandleFunc("POST /playground/runs", d.newRun)
 	mux.HandleFunc("GET /playground/runs/{id}", d.showRun)
 	mux.HandleFunc("POST /playground/runs/{id}/cancel", d.cancelRunHandler)
@@ -272,9 +273,12 @@ type view struct {
 
 type agentRow struct {
 	Name, Description, CLI, Model, URL string
-	MCP, Builtin                       []string
-	Remember, Secret                   bool
-	Problems                           []string
+	// SecretEnv is the environment variable the setup commands read the agent's secret from:
+	// the one its secret refers to, or a suggested name ("" when it has no secret).
+	SecretEnv        string
+	MCP, Builtin     []string
+	Remember, Secret bool
+	Problems         []string
 }
 
 // cliParts are the parts of the agent form that follow its CLI: the built-in tools choice, and
@@ -396,6 +400,9 @@ func (d *Dashboard) agentsPage(w http.ResponseWriter, r *http.Request) {
 		if publicURL != "" {
 			row.URL = publicURL + "/" + e.Key
 		}
+		if f.Secret != "" {
+			row.SecretEnv = secretEnv(e.Key, f.Secret)
+		}
 		for _, m := range f.MCP {
 			row.MCP = append(row.MCP, m.Name)
 		}
@@ -403,6 +410,17 @@ func (d *Dashboard) agentsPage(w http.ResponseWriter, r *http.Request) {
 		v.Agents = append(v.Agents, row)
 	}
 	d.render(w, "agents", v)
+}
+
+var envOnly = regexp.MustCompile(`^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$`)
+
+// secretEnv names the environment variable holding an agent's secret: the one its secret is
+// written as (${PM_SECRET}), or else <AGENT>_SECRET, for the caller to set.
+func secretEnv(agent, raw string) string {
+	if m := envOnly.FindStringSubmatch(strings.TrimSpace(raw)); m != nil {
+		return m[1]
+	}
+	return strings.ToUpper(strings.ReplaceAll(agent, "-", "_")) + "_SECRET"
 }
 
 func (d *Dashboard) agentPage(w http.ResponseWriter, r *http.Request) {
@@ -584,12 +602,34 @@ func errorLines(err error) []string {
 // Playground.
 
 type playView struct {
-	Agents    []playAgent
-	Agent     string // the one selected
-	Selected  *playAgent
-	Runs      []runView
-	Unready   string // why nothing can run
-	ContextID string
+	Agents        []playAgent
+	Agent         string // the conversation's agent, or the one picked for a new conversation
+	Selected      *playAgent
+	Unready       string     // why nothing can run
+	Conversations []convView // most recently used first
+	Polling       bool       // a run is unfinished: the list refreshes itself
+	Conv          *convView  // the conversation shown; nil for a new one
+	Runs          []runView  // its runs, oldest first
+	Gone          bool       // the conversation asked for is no longer kept
+	Blocked       string     // why the conversation shown cannot continue
+	Stale         bool       // the config changed since its last run
+	Headers       string     // the request headers, as last sent
+}
+
+// convList is the playground's list of conversations, conv the one shown ("" for none).
+type convList struct {
+	Conversations []convView
+	Polling       bool
+	Conv          string
+	OOB           bool // swapped in out of band, beside a run
+}
+
+func (p playView) List() convList {
+	l := convList{Conversations: p.Conversations, Polling: p.Polling}
+	if p.Conv != nil {
+		l.Conv = p.Conv.ID
+	}
+	return l
 }
 
 // playAgent is an agent as the playground describes it.
@@ -637,29 +677,62 @@ func shortDuration(d time.Duration) string {
 }
 
 func (d *Dashboard) playgroundPage(w http.ResponseWriter, r *http.Request) {
-	st := d.state()
-	v := d.view(r, "playground", st)
-	pg, err := d.playground()
-	if err != nil {
-		v.Play.Unready = err.Error()
-	} else {
-		for _, name := range pg.cfg.AgentNames() {
-			v.Play.Agents = append(v.Play.Agents, *describe(pg.cfg, name))
-		}
-		v.Play.Agent = r.URL.Query().Get("agent")
-		if pg.cfg.Agents[v.Play.Agent] == nil {
-			v.Play.Agent = pg.cfg.AgentNames()[0]
-		}
-		v.Play.Selected = describe(pg.cfg, v.Play.Agent)
-	}
-	d.mu.Lock()
-	runs := slices.Clone(d.runs)
-	current := d.play
-	d.mu.Unlock()
-	for _, rn := range runs {
-		v.Play.Runs = append(v.Play.Runs, rn.view(current))
-	}
+	v := d.view(r, "playground", d.state())
+	v.Play = d.playView(r.URL.Query().Get("c"), r.URL.Query().Get("agent"))
 	d.render(w, "playground", v)
+}
+
+// playView describes the playground showing conversation convID, or a new conversation with
+// agent (the first one by default).
+func (d *Dashboard) playView(convID, agent string) playView {
+	var v playView
+	pg, err := d.playground()
+	d.mu.Lock()
+	current := d.play
+	var conv *conversation
+	for _, c := range d.convs {
+		cv := c.view()
+		if c.ID == convID {
+			conv, cv.On = c, true
+			v.Conv = &cv
+			for _, rn := range c.runs {
+				v.Runs = append(v.Runs, rn.view(current))
+			}
+			v.Stale = len(c.runs) > 0 && c.runs[len(c.runs)-1].pg != current
+		}
+		v.Polling = v.Polling || cv.Running
+		v.Conversations = append(v.Conversations, cv)
+	}
+	d.mu.Unlock()
+	v.Gone = convID != "" && conv == nil
+	if conv != nil {
+		agent = conv.Agent
+	}
+	if err != nil {
+		v.Unready = err.Error()
+		return v
+	}
+	for _, name := range pg.cfg.AgentNames() {
+		v.Agents = append(v.Agents, *describe(pg.cfg, name))
+	}
+	if pg.cfg.Agents[agent] == nil && conv == nil {
+		agent = pg.cfg.AgentNames()[0]
+	}
+	v.Agent, v.Selected = agent, describe(pg.cfg, agent)
+	if conv != nil {
+		switch a := pg.cfg.Agents[agent]; {
+		case a == nil:
+			v.Blocked = agent + " is no longer in the config, so this conversation cannot continue."
+		case !a.Context.Remember:
+			v.Blocked = agent + " does not remember earlier tasks, so this conversation cannot continue."
+		}
+	}
+	return v
+}
+
+// conversationList refreshes the playground's list of conversations while runs are going.
+func (d *Dashboard) conversationList(w http.ResponseWriter, r *http.Request) {
+	d.renderPart(w, "conv-list", d.playView(r.URL.Query().Get("c"), "").List())
 }
 
 // playgroundAgent describes the agent picked in the playground's form.
@@ -674,6 +747,7 @@ func (d *Dashboard) playgroundAgent(w http.ResponseWriter, r *http.Request) {
 
 func (d *Dashboard) newRun(w http.ResponseWriter, r *http.Request) {
 	r.ParseForm()
+	convID := r.PostForm.Get("conversation")
 	agent := r.PostForm.Get("agent")
 	prompt := strings.TrimSpace(strings.ReplaceAll(r.PostForm.Get("message"), "\r\n", "\n"))
 	contextID := strings.TrimSpace(r.PostForm.Get("context"))
@@ -681,7 +755,8 @@ func (d *Dashboard) newRun(w http.ResponseWriter, r *http.Request) {
 		d.renderPart(w, "run-error", "Write a message for the agent first.")
 		return
 	}
-	keys, values, err := parsePairs(block(r.PostForm.Get("headers")), ":")
+	headers := r.PostForm.Get("headers")
+	keys, values, err := parsePairs(block(headers), ":")
 	if err != nil {
 		d.renderPart(w, "run-error", "Headers: "+err.Error())
 		return
@@ -690,13 +765,32 @@ func (d *Dashboard) newRun(w http.ResponseWriter, r *http.Request) {
 	for _, k := range keys {
 		header.Set(k, values[k])
 	}
-	rn, err := d.startRun(agent, contextID, prompt, header)
+	conv, rn, err := d.startRun(convID, agent, contextID, prompt, header)
 	if err != nil {
 		d.renderPart(w, "run-error", err.Error())
 		return
 	}
-	d.log.Info("playground run", "agent", agent, "task", rn.ID)
-	d.renderRun(w, rn)
+	d.log.Info("playground run", "agent", rn.Agent, "task", rn.ID)
+	w.Header().Set("HX-Trigger", "run-sent")
+	v := d.playView(conv.ID, "")
+	if conv.ID != convID {
+		// A new conversation: show it in place of the empty one.
+		v.Headers = headers
+		w.Header().Set("HX-Retarget", "#chat")
+		w.Header().Set("HX-Reswap", "outerHTML")
+		w.Header().Set("HX-Push-Url", "/playground?c="+conv.ID)
+		d.renderPart(w, "chat", v)
+		return
+	}
+	d.mu.Lock()
+	current := d.play
+	d.mu.Unlock()
+	list := v.List()
+	list.OOB = true
+	d.renderPart(w, "sent", struct {
+		Run  runView
+		List convList
+	}{rn.view(current), list})
 }
 
 func (d *Dashboard) renderRun(w http.ResponseWriter, rn *run) {

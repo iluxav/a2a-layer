@@ -82,24 +82,28 @@
 
 {{define "run"}}
 <article class="run" id="run-{{.ID}}"{{if not .Done}} hx-get="/playground/runs/{{.ID}}" hx-trigger="every 1s" hx-swap="outerHTML"{{end}}>
-  <header>
-    <span class="badge {{.State}}">{{.State}}</span>
-    <strong class="mono">{{.Agent}}</strong>
-    <span class="muted small">{{.Elapsed}}</span>
-    <span class="grow"></span>
-    {{if not .Done}}<button type="button" class="btn small ghost danger" hx-post="/playground/runs/{{.ID}}/cancel" hx-target="#run-{{.ID}}" hx-swap="outerHTML">Cancel</button>{{end}}
-  </header>
-  {{with .Note}}<p class="note">{{.}}</p>{{end}}
+  {{with .Note}}<p class="divider">{{.}}</p>{{end}}
   <div class="prompt">{{.Prompt}}</div>
-  {{if .Notes}}<ol class="log">{{range .Notes}}<li>{{.}}</li>{{end}}</ol>{{end}}
-  {{with .Failure}}<div class="failure">{{.}}</div>{{end}}
-  {{with .Answer}}<div class="answer">{{.}}</div>{{end}}
-  <footer>
-    {{range .Meta}}<span class="meta"><span>{{.Label}}</span> {{.Value}}</span>{{end}}
-    <span class="grow"></span>
-    {{if .Stale}}<span class="muted small" title="The config file changed after this run started">earlier config</span>{{end}}
-    {{if and .Remember .Done}}<button type="button" class="btn small continue" data-agent="{{.Agent}}" data-context="{{.ContextID}}" title="Send the next message in this conversation">Continue conversation</button>{{end}}
-  </footer>
+  <div class="reply">
+    <header>
+      <strong class="mono">{{.Agent}}</strong>
+      <span class="badge {{.State}}">{{.State}}</span>
+      <span class="muted small">{{.Elapsed}}</span>
+      <span class="grow"></span>
+      {{if not .Done}}<button type="button" class="btn small ghost danger" hx-post="/playground/runs/{{.ID}}/cancel" hx-target="#run-{{.ID}}" hx-swap="outerHTML">Cancel</button>{{end}}
+    </header>
+    {{if .Notes}}{{if .Done}}<details class="steps"><summary>{{len .Notes}} step{{if gt (len .Notes) 1}}s{{end}}</summary>{{end}}
+    <ol class="log">{{range .Notes}}<li>{{.}}</li>{{end}}</ol>
+    {{if .Done}}</details>{{end}}{{end}}
+    {{with .Failure}}<div class="failure">{{.}}</div>{{end}}
+    {{with .AnswerHTML}}<div class="answer md" hx-boost="false">{{.}}</div>{{end}}
+    <footer>
+      {{range .Meta}}<span class="meta"><span>{{.Label}}</span> {{.Value}}</span>{{end}}
+      <span class="grow"></span>
+      {{if .Stale}}<span class="muted small" title="The config file changed after this run started">earlier config</span>{{end}}
+      {{if .Answer}}<button type="button" class="btn small ghost copy" data-copy="{{.Answer}}" title="Copy the answer as Markdown">Copy</button>{{end}}
+    </footer>
+  </div>
 </article>
 {{end}}
 

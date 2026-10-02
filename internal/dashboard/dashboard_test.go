@@ -482,3 +482,98 @@ func TestOtherSitesAreKeptOut(t *testing.T) {
 		t.Errorf("a cross-site POST should be refused: %v %v", resp.StatusCode, err)
 	}
 }
+
+func TestAgentCardsShowHowToCallThemOverMCP(t *testing.T) {
+	t.Setenv("PM_SECRET", "s3cret")
+	_, ts, _ := newDashboard(t, "agents:\n  pm:\n    description: Plans.\n    secret: ${PM_SECRET}\n  qa-bot:\n    description: Tests.\n    secret: literal\n  open:\n    description: Open.\n", &echoRunner{})
+	page := get(t, ts, "/agents")
+	for _, want := range []string{
+		`<code>http://127.0.0.1:7300/pm/mcp</code>`,
+		`claude mcp add --transport http pm http://127.0.0.1:7300/pm/mcp --header "Authorization: Bearer $PM_SECRET"`,
+		`codex mcp add pm --url http://127.0.0.1:7300/pm/mcp --bearer-token-env-var PM_SECRET`,
+		`--bearer-token-env-var QA_BOT_SECRET`,
+		"claude mcp add --transport http open http://127.0.0.1:7300/open/mcp\n",
+	} {
+		if !strings.Contains(page, want) {
+			t.Errorf("the agents page lacks %q", want)
+		}
+	}
+}
+
+func TestAnswersAreRenderedFromMarkdownSafely(t *testing.T) {
+	got := string(markdown("# Done\n\n- **one**\n- `two`\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n" +
+		"<script>alert(1)</script>\n\n[x](javascript:alert(1)) [docs](https://example.com) https://go.dev\n"))
+	for _, want := range []string{"<h1>Done</h1>", "<strong>one</strong>", "<code>two</code>", "<table>",
+		`<a href="https://example.com" target="_blank" rel="noopener noreferrer">docs</a>`,
+		`<a href="https://go.dev" target="_blank" rel="noopener noreferrer">`} {
+		if !strings.Contains(got, want) {
+			t.Errorf("rendered answer lacks %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "<script") || strings.Contains(got, "javascript:") {
+		t.Errorf("rendered answer keeps raw HTML or a script link:\n%s", got)
+	}
+}
+
+var convID = regexp.MustCompile(`name="conversation" value="([0-9a-f]+)"`)
+
+// waitDone polls a run until it finishes, returning its card.
+func waitDone(t *testing.T, ts *httptest.Server, card string) string {
+	t.Helper()
+	m := runID.FindAllStringSubmatch(card, -1)
+	if m == nil {
+		t.Fatalf("no run in:\n%s", card)
+	}
+	id := m[len(m)-1][1]
+	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(20 * time.Millisecond) {
+		if card = get(t, ts, "/playground/runs/"+id); !strings.Contains(card, "hx-trigger") {
+			return card
+		}
+	}
+	t.Fatalf("run %s did not finish:\n%s", id, card)
+	return ""
+}
+
+func TestThePlaygroundKeepsAConversationTogether(t *testing.T) {
+	body := "agents:\n  helper:\n    description: Helps.\n    context:\n      remember: true\n  once:\n    description: Forgets.\n"
+	_, ts, _ := newDashboard(t, body, &echoRunner{})
+
+	// The first message starts a conversation, shown in place of the empty one.
+	_, chat, h := post(t, ts, "/playground/runs", url.Values{"agent": {"helper"}, "message": {"first question\nwith detail"}})
+	m := convID.FindStringSubmatch(chat)
+	if m == nil || h.Get("HX-Retarget") != "#chat" || h.Get("HX-Push-Url") != "/playground?c="+m[1] {
+		t.Fatalf("new conversation (%v):\n%s", h, chat)
+	}
+	conv := m[1]
+	waitDone(t, ts, chat)
+
+	// The next joins it: its run, and the list out of band.
+	_, sent, h := post(t, ts, "/playground/runs", url.Values{"conversation": {conv}, "agent": {"once"}, "message": {"second"}})
+	if h.Get("HX-Retarget") != "" || !strings.Contains(sent, `id="conv-list" hx-swap-oob="true"`) {
+		t.Fatalf("a reply should add to the thread (%v):\n%s", h, sent)
+	}
+	if done := waitDone(t, ts, sent); !strings.Contains(done, "<p>echo: second</p>") || !strings.Contains(done, "<strong class=\"mono\">helper</strong>") {
+		t.Errorf("the reply went to the conversation's agent, rendered:\n%s", done)
+	}
+	page := get(t, ts, "/playground?c="+conv)
+	if i, j := strings.Index(page, "echo: first question"), strings.Index(page, "echo: second"); i < 0 || j < i {
+		t.Errorf("the conversation should show both runs, oldest first:\n%s", page)
+	}
+	if !strings.Contains(page, `class="conv on" href="/playground?c=`+conv+`"`) || !strings.Contains(page, ">first question</span>") {
+		t.Errorf("the list should name the conversation by its first line:\n%s", page)
+	}
+
+	// An agent that remembers nothing has one message per conversation.
+	_, chat, h = post(t, ts, "/playground/runs", url.Values{"agent": {"once"}, "message": {"hi"}})
+	once := strings.TrimPrefix(h.Get("HX-Push-Url"), "/playground?c=")
+	waitDone(t, ts, chat)
+	if page := get(t, ts, "/playground?c="+once); !strings.Contains(page, "once does not remember earlier tasks") || strings.Contains(page, `id="play-form"`) {
+		t.Errorf("a forgetful agent's conversation should not offer a reply:\n%s", page)
+	}
+	if _, card, _ := post(t, ts, "/playground/runs", url.Values{"conversation": {once}, "message": {"again"}}); !strings.Contains(card, "not sent") {
+		t.Errorf("a reply to a forgetful agent should be refused:\n%s", card)
+	}
+	if page := get(t, ts, "/playground?c=nosuch"); !strings.Contains(page, "That conversation is gone") {
+		t.Error("an unknown conversation should say it is gone")
+	}
+}
